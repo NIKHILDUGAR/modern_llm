@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Shared evaluation helpers.
+
+Not a benchmark runner — just small utilities (model loading, multiple-choice
+log-likelihood scoring, simple greedy generation) that are reused across the
+per-benchmark eval_*.py scripts in this directory. Each eval script still works
+standalone, but this module keeps the boilerplate in one place.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import List, Optional, Sequence
+
+import torch
+from transformers import AutoTokenizer
+
+# Ensure modern_llm is importable when eval scripts are run from any CWD.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = PROJECT_ROOT / "src"
+for p in (str(PROJECT_ROOT), str(SRC_ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+
+DEFAULT_TOKENIZER = "Xenova/text-embedding-ada-002"
+
+
+_VALID_CONFIG_KEYS = {
+    "vocab_size", "d_model", "n_layers", "n_heads", "ffn_hidden_size",
+    "max_seq_len", "rmsnorm_eps", "dropout", "initializer_range",
+    "rope_theta", "rope_scaling", "use_rope", "use_attention_sinks",
+    "num_attention_sinks", "use_swiglu", "swiglu_multiplier", "use_gqa",
+    "gqa_groups", "use_moe", "moe_config", "tie_embeddings",
+}
+
+
+def load_scratch_model(checkpoint_path: str, device: str, tokenizer_name: str = DEFAULT_TOKENIZER):
+    """Load a ModernDecoderLM checkpoint + matching tokenizer.
+
+    Mirrors the loader in scripts/evaluation/eval_sst2.py but defaults the
+    tokenizer to the cl100k tokenizer (vocab=100261) actually used by the
+    gpu-full training runs — callers can override with --tokenizer if needed.
+    """
+    from modern_llm.config.model_config import ModernLLMConfig
+    from modern_llm.models.transformer import ModernDecoderLM
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    if "config" in checkpoint:
+        cfg = dict(checkpoint["config"])
+        if "num_layers" in cfg and "n_layers" not in cfg:
+            cfg["n_layers"] = cfg.pop("num_layers")
+        if "max_position_embeddings" in cfg and "max_seq_len" not in cfg:
+            cfg["max_seq_len"] = cfg.pop("max_position_embeddings")
+        cfg = {k: v for k, v in cfg.items() if k in _VALID_CONFIG_KEYS}
+        config = ModernLLMConfig(**cfg)
+    else:
+        raise ValueError(f"Checkpoint {checkpoint_path} missing 'config' key.")
+
+    model = ModernDecoderLM(config)
+    state_dict = checkpoint.get("model_state", checkpoint.get("model_state_dict", checkpoint.get("model", checkpoint)))
+    model.load_state_dict(state_dict, strict=False)
+    model.to(device)
+    model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
+
+
+@torch.no_grad()
+def score_completion(model, tokenizer, prompt: str, completion: str, device: str) -> float:
+    """Return sum of log-probs assigned to the completion tokens given the prompt.
+
+    Math:
+        score = sum_{t in completion} log p(x_t | x_<t)
+    where p is the model's next-token distribution over the concatenated
+    prompt+completion sequence. Longer completions get more-negative scores, so
+    callers that compare completions of different lengths should length-normalize.
+    """
+    max_len = getattr(model.config, "max_seq_len", 1024)
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    completion_ids = tokenizer.encode(completion, add_special_tokens=False)
+    if len(completion_ids) == 0:
+        return 0.0
+    # Truncate from the left of the prompt to fit context
+    total_budget = max_len - 1
+    if len(prompt_ids) + len(completion_ids) > total_budget:
+        keep = total_budget - len(completion_ids)
+        prompt_ids = prompt_ids[-max(keep, 0):]
+    input_ids = torch.tensor([prompt_ids + completion_ids], device=device, dtype=torch.long)
+    outputs = model(input_ids)
+    logits = outputs["logits"]  # (1, T, V)
+    # next-token prediction: logits[:, t, :] predicts token at position t+1
+    log_probs = torch.log_softmax(logits[0, :-1, :], dim=-1)
+    target = input_ids[0, 1:]
+    # Sum log-probs over the completion positions only
+    prompt_len = len(prompt_ids)
+    comp_positions = slice(prompt_len - 1, prompt_len - 1 + len(completion_ids))
+    gathered = log_probs[comp_positions, :].gather(1, target[comp_positions].unsqueeze(1)).squeeze(1)
+    return float(gathered.sum().item())
+
+
+@torch.no_grad()
+def mc_argmax(
+    model,
+    tokenizer,
+    prompt: str,
+    choices: Sequence[str],
+    device: str,
+    length_normalize: bool = False,
+) -> int:
+    """Return the index of the highest-scoring choice.
+
+    length_normalize=True divides by completion token count (useful when
+    choices differ greatly in length, e.g. HellaSwag endings).
+    """
+    scores = []
+    for c in choices:
+        s = score_completion(model, tokenizer, prompt, c, device)
+        if length_normalize:
+            tok_len = max(1, len(tokenizer.encode(c, add_special_tokens=False)))
+            s = s / tok_len
+        scores.append(s)
+    return int(max(range(len(scores)), key=lambda i: scores[i]))
+
+
+@torch.no_grad()
+def greedy_generate(
+    model,
+    tokenizer,
+    prompt: str,
+    device: str,
+    max_new_tokens: int = 128,
+    stop_strings: Optional[List[str]] = None,
+) -> str:
+    """Greedy decode with optional string-level stopping.
+
+    The scratch model has no KV cache, so this is O(max_new_tokens * seq)
+    per call. Kept simple on purpose.
+    """
+    max_len = getattr(model.config, "max_seq_len", 1024)
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if len(prompt_ids) >= max_len:
+        prompt_ids = prompt_ids[-(max_len - 1):]
+    generated = torch.tensor([prompt_ids], device=device, dtype=torch.long)
+    produced: List[int] = []
+    eos = tokenizer.eos_token_id
+    for _ in range(max_new_tokens):
+        if generated.shape[1] >= max_len:
+            break
+        outputs = model(generated)
+        next_token = int(outputs["logits"][0, -1, :].argmax().item())
+        produced.append(next_token)
+        generated = torch.cat([generated, torch.tensor([[next_token]], device=device)], dim=1)
+        if eos is not None and next_token == eos:
+            break
+        if stop_strings:
+            partial = tokenizer.decode(produced, skip_special_tokens=True)
+            if any(s in partial for s in stop_strings):
+                for s in stop_strings:
+                    if s in partial:
+                        partial = partial.split(s)[0]
+                return partial
+    return tokenizer.decode(produced, skip_special_tokens=True)
