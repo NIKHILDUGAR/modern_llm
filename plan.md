@@ -177,7 +177,7 @@ Confirmed in `src/modern_llm/models/`:
 
 | Feature | Status | Why | Where |
 |---|---|---|---|
-| **QK-norm** | NEW | Scaling Transformers / Chameleon — stabilizes attention logits, near-free fix for bf16 NaN spikes | `attention.py`: RMSNorm on Q,K before RoPE |
+| **QK-norm** | DONE | Scaling Transformers / Chameleon / OLMo-2 — stabilizes attention logits, near-free fix for bf16 NaN spikes | `attention.py`: per-head `RMSNorm(head_dim)` on Q and K before RoPE (order doesn't matter — RMSNorm is invariant to orthogonal rotations). Flag: `ModernLLMConfig.use_qk_norm`, threaded via `DecoderBlock` → `AttentionConfig`. Applies to sink_k on the manual-attention path. Default OFF for back-compat; `configs/lm_75m_2x4090.json` sets it ON. |
 | **Residual init scaling** | NEW | Megatron — init residual proj at std = 0.02/sqrt(2*n_layers); critical at 18 layers | `transformer.py` `_init_weights` |
 | **Scaled embeddings** | NEW | PaLM, LLaMA — multiply token embeddings by sqrt(d_model) | `transformer.py` forward |
 | **Z-loss (1e-4)** | NEW | PaLM §5.1 — penalizes logit norm, stabilizes bf16 without fp32 softmax | training loop |
@@ -611,10 +611,13 @@ upcoming PRs.
 5. **M5 DONE**: `scripts/evaluation/_eval_common.py` `DEFAULT_TOKENIZER`
    now prefers `tokenizers/cl_small_bpe_16k` when present, falls back to
    cl100k for archived runs.
-6. **M6 TODO**: Add `configs/lm_75m_2x4090.json` with the final 18L/d=512
-   architecture, GPU mem 24, world_size 2, bf16, compile ON.
-7. **M7 TODO**: Implement QK-norm in `attention.py`; add `use_qk_norm`
-   flag.
+6. **M6 DONE**: `configs/lm_75m_2x4090.json` with the final 18L/d=512
+   architecture, GPU mem 24, world_size 2, bf16, compile ON. `use_qk_norm: true`.
+7. **M7 DONE**: QK-norm implemented in `src/modern_llm/models/attention.py`
+   (per-head `RMSNorm(head_dim)` on Q and K before RoPE, applied to sink_k
+   on the manual path). Flag `use_qk_norm` added to `ModernLLMConfig`,
+   `AttentionConfig`, `PipelineConfig`, and threaded through `DecoderBlock`.
+   Smoke-tested: works with Flash SDPA, GQA, and attention-sinks paths.
 8. **M8 TODO**: Residual init scaling + scaled embeddings + z-loss in
    `transformer.py` / training loop.
 9. **M9 TODO**: `torch.compile` toggle in `trainer_base.py` (default

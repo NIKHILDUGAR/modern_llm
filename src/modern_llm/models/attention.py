@@ -7,6 +7,10 @@
   every token can attend to, improving long-context stability.
 - Grouped Query Attention (GQA) mirrors Ainslie et al. (2023) by sharing K/V
   heads across multiple Q heads to reduce KV cache memory.
+- QK-norm (Henry et al., 2020; ViT-22B, Chameleon, OLMo-2) applies RMSNorm over
+  each head's dimension to Q and K before the dot product, stabilising logits
+  in bf16 at depth without changing the mathematical meaning of RoPE (RMSNorm
+  is invariant to orthogonal rotations, so order w.r.t. RoPE is equivalent).
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+from .layers import RMSNorm
 
 
 @dataclass
@@ -33,6 +39,8 @@ class AttentionConfig:
     num_attention_sinks: int = 2
     use_gqa: bool = False
     gqa_groups: Optional[int] = None
+    use_qk_norm: bool = False
+    qk_norm_eps: float = 1e-5
     dropout: float = 0.0
     use_flash_attention: bool = True  # Use PyTorch SDPA (includes Flash Attention)
 
@@ -88,6 +96,13 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
+        if config.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=config.qk_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.qk_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
         inv_freq = 1.0 / (
             config.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
         )
@@ -105,6 +120,10 @@ class MultiHeadAttention(nn.Module):
         k = self._shape_kv(self.k_proj(hidden_states))
         v = self._shape_kv(self.v_proj(hidden_states))
 
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         if self.config.use_rope:
             q = self._apply_rope(q, seq_len, offset=self.config.num_attention_sinks if self.config.use_attention_sinks else 0)
             k = self._apply_rope(k, seq_len)
@@ -119,6 +138,8 @@ class MultiHeadAttention(nn.Module):
             sink_states = self.sink_states.unsqueeze(0).expand(batch_size, -1, -1)
             sink_k = self._shape_kv(self.k_proj(sink_states))
             sink_v = self._shape_kv(self.v_proj(sink_states))
+            if self.k_norm is not None:
+                sink_k = self.k_norm(sink_k)
             if self.config.use_rope:
                 sink_k = self._apply_rope(sink_k, self.config.num_attention_sinks, offset=0)
             if self.num_kv_heads != self.num_q_heads:

@@ -25,10 +25,10 @@ class PipelineConfig:
 
     # Model architecture
     vocab_size: int = 50257
-    d_model: int = 768
-    n_layers: int = 12
-    n_heads: int = 12
-    ffn_hidden_size: int = 3072
+    d_model: int = 512
+    n_layers: int = 8
+    n_heads: int = 8
+    ffn_hidden_size: int = 1536
     max_seq_len: int = 1024
     dropout: float = 0.1
     use_rope: bool = True
@@ -36,8 +36,9 @@ class PipelineConfig:
     num_attention_sinks: int = 4
     use_swiglu: bool = True
     tie_embeddings: bool = True
-    use_gqa: bool = False
-    gqa_groups: Optional[int] = None
+    use_gqa: bool = True
+    gqa_groups: Optional[int] = 2
+    use_qk_norm: bool = False
     use_moe: bool = False
 
     # Hardware
@@ -52,7 +53,7 @@ class PipelineConfig:
     # Pretraining
     pretrain_max_steps: int = 20000
     pretrain_lr: float = 3e-4
-    pretrain_batch_size: int = 64
+    pretrain_batch_size: int = 2
     pretrain_micro_batch_size: int = 2
     pretrain_warmup_steps: int = 500
 
@@ -79,23 +80,35 @@ class PipelineConfig:
     verifier_micro_batch_size: int = 4
 
     # Paths
-    output_dir: str = "experiments/runs"
-    run_name: str = "modern-llm-pipeline"
-    tokenizer_name: str = "gpt2"
+    from datetime import datetime
+    now = datetime.now()
+    now= str(now).replace(" ","")
+    now= str(now).replace(":","")
+
+    output_dir: str = "experiments/runs/"+now
+    run_name: str = "modern-llm-pipeline1"+now+str(d_model) + str(n_layers)+str(n_heads)
+    tokenizer_name: str = "Xenova/text-embedding-ada-002"
 
     # Misc
     seed: int = 42
     mixed_precision: str = "bf16"
     eval_every: int = 500
     save_every: int = 2000
-    log_every: int = 100
+    log_every: int = 1000
 
     def get_model_config(self) -> ModernLLMConfig:
         """Build ModernLLMConfig from pipeline settings."""
         moe_config = None
+        import json
+        with open(self.output_dir+'config.txt', 'w') as fp:
+            for key, value in self.__dict__.items():    
+                fp.write(f"{key}: {value}")
+                print(f"{key}: {value}")
+
         if self.use_moe:
             moe_config = MoEConfig()
 
+        print("get_hardware_preset(self.hardware_preset",get_hardware_preset(self.hardware_preset))
         return ModernLLMConfig(
             vocab_size=self.vocab_size,
             d_model=self.d_model,
@@ -111,6 +124,7 @@ class PipelineConfig:
             tie_embeddings=self.tie_embeddings,
             use_gqa=self.use_gqa,
             gqa_groups=self.gqa_groups,
+            use_qk_norm=self.use_qk_norm,
             use_moe=self.use_moe,
             moe_config=moe_config,
         )
@@ -232,59 +246,21 @@ class PipelineConfig:
 
 
 # Preset pipeline configurations
-
 def local_smoke_config() -> PipelineConfig:
-    """Minimal config for quick smoke testing on local machine."""
     return PipelineConfig(
-        d_model=256,
-        n_layers=4,
-        n_heads=4,
-        ffn_hidden_size=512,
-        max_seq_len=256,
-        hardware_preset="local",
-        data_preset="small",
-        pretrain_max_steps=100,
-        sft_max_steps=50,
-        dpo_max_steps=50,
-        verifier_max_steps=50,
-        run_name="smoke-test",
     )
 
 
 def local_full_config() -> PipelineConfig:
-    """Full config for RTX 3060 training."""
     return PipelineConfig(
         d_model=768,
-        n_layers=12,
-        n_heads=12,
-        ffn_hidden_size=3072,
-        max_seq_len=1024,
-        hardware_preset="local",
-        data_preset="medium",
-        pretrain_max_steps=20000,
-        sft_max_steps=5000,
-        dpo_max_steps=2000,
-        verifier_max_steps=3000,
-        run_name="local-full",
     )
 
 
 def gpu_smoke_config() -> PipelineConfig:
-    """Minimal config for GPU smoke testing."""
     return PipelineConfig(
-        d_model=256,
-        n_layers=4,
-        n_heads=4,
-        ffn_hidden_size=512,
-        max_seq_len=256,
-        hardware_preset="auto",
-        data_preset="small",
-        pretrain_max_steps=100,
-        sft_max_steps=50,
-        dpo_max_steps=50,
-        verifier_max_steps=50,
-        run_name="gpu-smoke",
     )
+
 
 
 def gpu_full_config() -> PipelineConfig:
@@ -303,35 +279,43 @@ def gpu_full_config() -> PipelineConfig:
     - Verifier: 3K steps = 2h
     - Total: ~42h (under 48h limit)
     """
+    print("spdaopsaodpsaodpodspoapdosapdoapdoas")
     return PipelineConfig(
-        d_model=1024,
-        n_layers=12,
-        n_heads=16,
-        ffn_hidden_size=4096,
+            d_model=512,
+        n_layers=10,
+        n_heads=4,
+        ffn_hidden_size=1024,
         max_seq_len=1024,
         use_attention_sinks=False,  # Disable to enable Flash Attention
         hardware_preset="auto",
-        data_preset="large",
+        data_preset="xl",
         pretrain_datasets=[
             "wikitext-103-raw-v1",
             "openwebtext",
             "wikipedia",
-            "roneneldan/TinyStories:100000",  # Downsample to 100K
+            "EleutherAI/fineweb-edu-dedup-10b",
+           # "HuggingFaceTB/smollm-corpus"
+            "roneneldan/TinyStories",  # Downsample to 100K
         ],
-        pretrain_max_steps=80000,
-        pretrain_batch_size=128,
-        pretrain_micro_batch_size=32,  # H100 can handle much larger
-        sft_max_steps=10000,
-        sft_datasets=[
+        pretrain_max_steps=120000,
+        pretrain_batch_size=64,
+        pretrain_micro_batch_size=16,  # H100 can handle much larger
+        sft_batch_size=64,
+        sft_micro_batch_size=8,
+        dpo_batch_size=32,
+        dpo_micro_batch_size=8,
+        verifier_batch_size =64,
+        verifier_micro_batch_size=16,
+        sft_max_steps=30000,
+        sft_datasets=["QuixiAI/dolphin",
             "tatsu-lab/alpaca",
             "databricks/databricks-dolly-15k",
-            "Open-Orca/OpenOrca:50000",  # Sample 50K from larger dataset
+            "Open-Orca/OpenOrca",  # Sample 50K from larger dataset
         ],
-        dpo_max_steps=3000,
-        verifier_max_steps=3000,
-        run_name="gpu-full",
-        eval_every=20000,  # Eval only 4 times during 80K pretrain (was 2000)
-        save_every=20000,
+        dpo_max_steps=1000,
+        verifier_max_steps=1000,
+        eval_every=10000,  # Eval only 4 times during 80K pretrain (was 2000)
+        save_every=10000,
     )
 
 

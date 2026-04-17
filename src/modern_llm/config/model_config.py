@@ -55,6 +55,7 @@ class ModernLLMConfig:
     swiglu_multiplier: float = 2.0
     use_gqa: bool = False
     gqa_groups: Optional[int] = None
+    use_qk_norm: bool = False
     use_moe: bool = False
     moe_config: Optional[MoEConfig] = None
     tie_embeddings: bool = True

@@ -54,6 +54,8 @@ class DecoderBlock(nn.Module):
             num_attention_sinks=config.num_attention_sinks,
             use_gqa=config.use_gqa,
             gqa_groups=config.gqa_groups,
+            use_qk_norm=config.use_qk_norm,
+            qk_norm_eps=config.rmsnorm_eps,
             dropout=config.dropout,
         )
         self.attn = MultiHeadAttention(attn_config)
