@@ -10,6 +10,10 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from modern_llm.utils.paths import apply_env_defaults, cache_dir_for_datasets
+
+apply_env_defaults()
+
 
 @dataclass
 class PreferenceDatasetConfig:
@@ -104,6 +108,7 @@ def load_preference_dataset(config: PreferenceDatasetConfig):
         config.dataset_name,
         config.dataset_config_name,
         split=config.split,
+        cache_dir=cache_dir_for_datasets(),
     )
     column_names = dataset.column_names
     

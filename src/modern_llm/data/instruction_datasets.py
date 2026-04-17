@@ -13,6 +13,11 @@ import torch
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
+from modern_llm.training.distributed import maybe_distributed_sampler
+from modern_llm.utils.paths import apply_env_defaults, cache_dir_for_datasets
+
+apply_env_defaults()
+
 
 @dataclass
 class InstructionDatasetConfig:
@@ -93,7 +98,7 @@ class InstructionDataset(Dataset):
         except ImportError as e:
             raise ImportError("datasets package required: pip install datasets") from e
 
-        raw = load_dataset(self.config.dataset_name, split=self.config.split)
+        raw = load_dataset(self.config.dataset_name, split=self.config.split, cache_dir=cache_dir_for_datasets())
 
         if self.config.num_examples:
             raw = raw.select(range(min(self.config.num_examples, len(raw))))
@@ -216,10 +221,12 @@ def create_instruction_dataloader(
             "labels": torch.stack([x["labels"] for x in batch]),
         }
 
+    sampler = maybe_distributed_sampler(dataset, shuffle=shuffle)
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        sampler=sampler,
+        shuffle=False if sampler is not None else shuffle,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,

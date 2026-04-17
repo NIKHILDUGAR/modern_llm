@@ -22,6 +22,8 @@ Usage:
 """
 
 import argparse
+import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -29,10 +31,75 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from modern_llm.config import PipelineConfig, get_pipeline_preset
+# Apply HF cache redirects as soon as we know where the repo is. Done
+# *before* any HF import so cache settings stick.
+from modern_llm.utils.paths import apply_env_defaults  # noqa: E402
+
+apply_env_defaults()
+
+from modern_llm.config import PipelineConfig, get_pipeline_preset  # noqa: E402
 
 
 VALID_STAGES = {"pretrain", "sft", "dpo", "verifier", "eval", "all"}
+
+
+def _maybe_self_spawn_under_torchrun(nproc_per_node: int) -> None:
+    """If the user requested >1 process and we are not already a torchrun
+    child, re-exec the current script under `torchrun --standalone
+    --nproc_per_node=N`.
+
+    Pre: nproc_per_node >= 1.
+    Post: function returns only when the current process is a single-rank
+          worker (either nproc_per_node==1, or we are already under torchrun).
+          Otherwise it execvp's torchrun and never returns.
+
+    This preserves the user's preferred invocation:
+        python3 scripts/run_pipeline.py --config gpu --stage all --nproc-per-node 2
+    while still using the canonical torchrun launcher under the hood.
+    """
+    if nproc_per_node <= 1:
+        return
+    # Already a torchrun child? torchrun sets all of these.
+    if "TORCHELASTIC_RUN_ID" in os.environ or "WORLD_SIZE" in os.environ:
+        return
+
+    torchrun = shutil.which("torchrun") or shutil.which("torch.distributed.run")
+    if torchrun is None:
+        # Fall back to `python -m torch.distributed.run`.
+        argv = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={nproc_per_node}",
+            *sys.argv,
+        ]
+    else:
+        # Drop --nproc-per-node from re-exec argv so torchrun children do not
+        # try to recursively re-exec themselves.
+        forwarded = [
+            a for a in sys.argv
+            if not a.startswith("--nproc-per-node") and not a.startswith("--nproc_per_node")
+        ]
+        # Also strip the value following the flag if it was passed separately.
+        cleaned = []
+        skip_next = False
+        for a in forwarded:
+            if skip_next:
+                skip_next = False
+                continue
+            if a in ("--nproc-per-node", "--nproc_per_node"):
+                skip_next = True
+                continue
+            cleaned.append(a)
+        argv = [
+            torchrun,
+            "--standalone",
+            f"--nproc_per_node={nproc_per_node}",
+            *cleaned,
+        ]
+    print(f"[run_pipeline] self-spawning under torchrun: {' '.join(argv)}", flush=True)
+    os.execvp(argv[0], argv)
 
 
 def _report_exists(config: PipelineConfig) -> bool:
@@ -282,18 +349,32 @@ Stages:
         action="store_true",
         help="Overwrite existing reports/results",
     )
+    parser.add_argument(
+        "--nproc-per-node",
+        type=int,
+        default=1,
+        help=(
+            "Number of GPU processes to launch via torchrun. When >1, the "
+            "script re-execs itself under `torchrun --standalone "
+            "--nproc_per_node=N`. When 1 (default), runs in-process."
+        ),
+    )
 
     args = parser.parse_args()
 
+    # Self-spawn under torchrun if multi-GPU was requested. Returns only on
+    # rank workers (or in the single-process case).
+    _maybe_self_spawn_under_torchrun(args.nproc_per_node)
+
     # Load config
     config_path = Path(args.config)
+
     if config_path.exists():
         print(f"Loading config from file: {args.config}")
         config = PipelineConfig.load(args.config)
     else:
         print(f"Using config preset: {args.config}")
         config = get_pipeline_preset(args.config)
-
     # Apply overrides
     if args.run_name:
         config.run_name = args.run_name
@@ -315,19 +396,23 @@ Stages:
     output_dir = args.output_dir or Path("experiments/runs") / config.run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Print banner
-    print()
-    print("=" * 60)
-    print("Modern LLM Pipeline")
-    print("=" * 60)
-    print(f"Config:       {args.config}")
-    print(f"Run name:     {config.run_name}")
-    print(f"Stage:        {args.stage}")
-    print(f"Output dir:   {output_dir}")
-    print(f"Model:        d={config.d_model}, L={config.n_layers}, H={config.n_heads}")
-    print(f"Start time:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
-    print()
+    # Banner on rank 0 only so multi-rank logs stay readable.
+    rank0 = int(os.environ.get("RANK", "0")) == 0
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if rank0:
+        print()
+        print("=" * 60)
+        print("Modern LLM Pipeline")
+        print("=" * 60)
+        print(f"Config:       {args.config}")
+        print(f"Run name:     {config.run_name}")
+        print(f"Stage:        {args.stage}")
+        print(f"Output dir:   {output_dir}")
+        print(f"Model:        d={config.d_model}, L={config.n_layers}, H={config.n_heads}")
+        print(f"World size:   {world}")
+        print(f"Start time:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60)
+        print()
 
     # Check for existing results
     if args.stage in {"all", "eval"}:

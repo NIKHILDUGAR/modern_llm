@@ -3,6 +3,17 @@
 WikiText-2 (Merity et al., 2016) and TinyStories (Gao et al., 2023) are the
 primary corpora; this module standardizes how we fetch and tokenize them so the
 training scripts can assume reproducible, research-grade preprocessing.
+
+DDP notes
+---------
+- For map-style tokenized datasets (the path used by `load_causal_lm_dataset`),
+  callers should construct dataloaders via `make_lm_dataloader` below, which
+  attaches a `DistributedSampler` when `WORLD_SIZE > 1` and otherwise behaves
+  exactly like the previous single-process loader.
+- For HF streaming datasets, use `datasets.distributed.split_dataset_by_node`
+  so each rank consumes a disjoint stream shard.
+- All `load_dataset` calls route through `cache_dir=` so the data lands in
+  `data/raw/hf_cache/` (configurable via `HF_DATASETS_CACHE`).
 """
 
 from __future__ import annotations
@@ -10,7 +21,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional
 
+from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
+
+from modern_llm.training.distributed import (
+    is_distributed,
+    maybe_distributed_sampler,
+    split_iterable_by_rank,
+    world_size,
+)
+from modern_llm.utils.paths import apply_env_defaults, cache_dir_for_datasets
+
+
+# Apply env defaults at import time so any subsequent `from datasets import ...`
+# inside this process picks up the correct HF_DATASETS_CACHE.
+apply_env_defaults()
 
 
 # Dataset name -> (hf_name, hf_config, text_field) mapping
@@ -34,6 +59,7 @@ class LanguageModelingDatasetConfig:
     max_length: int = 1024
     num_proc: Optional[int] = None
     streaming: bool = False
+    cache_dir: Optional[str] = None  # Defaults to HF_DATASETS_CACHE / data/raw/hf_cache
 
     def __post_init__(self) -> None:
         if not self.dataset_name:
@@ -63,23 +89,47 @@ def load_causal_lm_dataset(
         - `tokenizer` is a causal LM tokenizer with `pad_token_id` defined.
         - the Hugging Face dataset specified in `config` is reachable.
     Post:
-        - returns a tokenized `datasets.Dataset` with `input_ids` and `attention_mask` tensors.
+        - returns a tokenized `datasets.Dataset` (map-style) with `input_ids`,
+          `attention_mask`, and `labels` columns. For streaming datasets, returns
+          a tokenized `IterableDataset` already sharded by rank when distributed.
     Complexity:
         - O(num_examples · max_length) due to tokenization work.
-    Invariants:
-        - Output dataset always exposes `input_ids`, `attention_mask`, `labels`.
     """
-
     load_dataset = _require_datasets()
+    cache_dir = config.cache_dir or cache_dir_for_datasets()
     dataset = load_dataset(
         config.dataset_name,
         config.dataset_config_name,
         split=config.split,
         streaming=config.streaming,
+        cache_dir=cache_dir,
     )
 
     if config.streaming:
-        raise NotImplementedError("Streaming datasets are not yet supported in Phase 0 scaffolding.")
+        # Shard the stream so each DDP rank sees a disjoint subset before
+        # tokenizing — this avoids redundant compute across ranks.
+        if is_distributed():
+            dataset = split_iterable_by_rank(dataset)
+
+        def _stream_tokenize(example):
+            text = example[config.text_field]
+            outputs = tokenizer(
+                text,
+                truncation=True,
+                max_length=config.max_length,
+                padding="max_length",
+                return_tensors=None,
+            )
+            mask = outputs["attention_mask"]
+            ids = outputs["input_ids"]
+            labels = [tok if mask[idx] == 1 else -100 for idx, tok in enumerate(ids)]
+            return {
+                "input_ids": ids,
+                "attention_mask": mask,
+                "labels": labels,
+            }
+
+        return dataset.map(_stream_tokenize, remove_columns=dataset.column_names if dataset.column_names else None)
 
     column_names = dataset.column_names
     if config.text_field not in column_names:
@@ -118,9 +168,39 @@ def load_causal_lm_dataset(
     return tokenized
 
 
+def make_lm_dataloader(
+    dataset,
+    micro_batch_size: int,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    drop_last: bool = True,
+    seed: int = 42,
+) -> DataLoader:
+    """Build a DataLoader that is correct under DDP.
+
+    Pre: `dataset` is a map-style dataset (HF Dataset or torch Dataset). For
+         iterable/streaming datasets, do NOT use this — just wrap with
+         `DataLoader(ds, batch_size=...)` since ranks are pre-sharded.
+    Post: returns a DataLoader; uses DistributedSampler when WORLD_SIZE > 1.
+    """
+    sampler = maybe_distributed_sampler(dataset, shuffle=shuffle, seed=seed, drop_last=drop_last)
+    return DataLoader(
+        dataset,
+        batch_size=micro_batch_size,
+        sampler=sampler,
+        # When a sampler is used, shuffle must be False.
+        shuffle=False if sampler is not None else shuffle,
+        drop_last=drop_last,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
+
+
 def _parse_dataset_spec(spec: str) -> tuple:
     """Parse dataset spec like 'name:100000' into (name, max_samples).
-    
+
     Examples:
         'wikitext-103-raw-v1' -> ('wikitext-103-raw-v1', None)
         'roneneldan/TinyStories:100000' -> ('roneneldan/TinyStories', 100000)
@@ -131,7 +211,6 @@ def _parse_dataset_spec(spec: str) -> tuple:
         try:
             max_samples = int(parts[1])
         except ValueError:
-            # Not a number, treat whole thing as name
             return spec, None
         return name, max_samples
     return spec, None
@@ -145,35 +224,27 @@ def load_multi_dataset(
     max_samples_per_dataset: Optional[int] = None,
 ):
     """Load and concatenate multiple datasets for pretraining.
-    
+
     Pre: dataset_names are keys in DATASET_REGISTRY or valid HF dataset paths.
          Supports 'name:N' syntax to cap individual datasets (e.g. 'TinyStories:100000').
     Post: Returns concatenated tokenized dataset.
-    
-    Args:
-        dataset_names: List of dataset identifiers (optionally with :N suffix)
-        tokenizer: Tokenizer to use
-        split: Dataset split (train/validation)
-        max_length: Max sequence length
-        max_samples_per_dataset: Global cap for all datasets (per-dataset :N takes precedence)
     """
     from datasets import concatenate_datasets
-    
+
     all_datasets = []
-    
+
     for spec in dataset_names:
         name, per_dataset_cap = _parse_dataset_spec(spec)
         print(f"Loading dataset: {name}" + (f" (capped to {per_dataset_cap})" if per_dataset_cap else ""))
-        
+
         # Look up in registry or use as-is
         if name in DATASET_REGISTRY:
             hf_name, hf_config, text_field = DATASET_REGISTRY[name]
         else:
-            # Assume it's a direct HF path
             hf_name = name
             hf_config = None
             text_field = "text"
-        
+
         try:
             config = LanguageModelingDatasetConfig(
                 dataset_name=hf_name,
@@ -183,29 +254,25 @@ def load_multi_dataset(
                 max_length=max_length,
             )
             dataset = load_causal_lm_dataset(config, tokenizer)
-            
-            # Apply per-dataset cap first, then global cap
+
             cap = per_dataset_cap or max_samples_per_dataset
             if cap and len(dataset) > cap:
                 dataset = dataset.select(range(cap))
                 print(f"  Capped to {cap} samples")
-            
+
             print(f"  Loaded {len(dataset)} samples from {name}")
             all_datasets.append(dataset)
-            
+
         except Exception as e:
             print(f"  WARNING: Failed to load {name}: {e}")
             continue
-    
+
     if not all_datasets:
         raise ValueError("No datasets were successfully loaded")
-    
-    # Concatenate all datasets
+
     combined = concatenate_datasets(all_datasets)
     combined = combined.shuffle(seed=42)
-    # Re-apply torch format (lost after concatenate/shuffle)
     combined.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     print(f"Combined dataset: {len(combined)} total samples")
-    
-    return combined
 
+    return combined

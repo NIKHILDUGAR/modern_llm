@@ -26,8 +26,21 @@ from modern_llm.alignment.dpo_loss import dpo_loss
 from modern_llm.config import ModernLLMConfig, PipelineConfig, TrainingConfig
 from modern_llm.data.preference_datasets import PreferenceDatasetConfig, load_preference_dataset
 from modern_llm.models.transformer import ModernDecoderLM
+from modern_llm.training.distributed import (
+    barrier,
+    get_device,
+    init_distributed,
+    is_main_process,
+    maybe_distributed_sampler,
+    seed_everything,
+    unwrap_model,
+    wrap_ddp,
+)
 from modern_llm.utils.checkpointing import load_checkpoint, save_checkpoint
 from modern_llm.utils.logging_utils import create_logger
+from modern_llm.utils.paths import apply_env_defaults
+
+apply_env_defaults()
 
 
 @dataclass
@@ -177,7 +190,11 @@ class DPOTrainer:
         eval_dataloader: Optional[DataLoader] = None,
         lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     ):
-        self.model = model
+        # Bring up DDP first so device + seed are correct.
+        init_distributed()
+        if config.seed is not None:
+            seed_everything(config.seed)
+
         self.optimizer = optimizer
         self.train_dataloader = train_dataloader
         self.config = config
@@ -185,8 +202,10 @@ class DPOTrainer:
         self.eval_dataloader = eval_dataloader
         self.lr_scheduler = lr_scheduler
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        self.device = get_device()
+        model.to(self.device)
+        # NOTE: wrap_ddp returns the bare model when WORLD_SIZE<=1.
+        self.model = wrap_ddp(model)
 
         self.logger = create_logger(f"dpo.{config.run_name}")
         self.use_amp = config.mixed_precision in {"fp16", "bf16"} and self.device.type == "cuda"
@@ -203,8 +222,19 @@ class DPOTrainer:
         accumulation_steps = self.config.gradient_accumulation_steps
         max_steps = self.config.max_steps
 
-        with tqdm(total=max_steps, desc="DPO Training", unit="step") as pbar:
+        epoch = 0
+        with tqdm(
+            total=max_steps,
+            desc="DPO Training",
+            unit="step",
+            disable=not is_main_process(),
+        ) as pbar:
             while self.global_step < max_steps:
+                # Reshuffle DistributedSampler each epoch.
+                sampler = getattr(self.train_dataloader, "sampler", None)
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
+
                 for batch in self.train_dataloader:
                     prev_step = self.global_step
                     loss, metrics = self._training_step(batch, accumulation_steps)
@@ -216,7 +246,11 @@ class DPOTrainer:
                     if self.global_step >= max_steps:
                         break
 
-                    if self.config.log_every > 0 and self.global_step % self.config.log_every == 0:
+                    if (
+                        self.config.log_every > 0
+                        and self.global_step % self.config.log_every == 0
+                        and is_main_process()
+                    ):
                         self.logger.info(
                             "step=%d loss=%.4f accuracy=%.2f%% lr=%.3e",
                             self.global_step,
@@ -230,6 +264,7 @@ class DPOTrainer:
 
                 if self.global_step >= max_steps:
                     break
+                epoch += 1
 
         self._save_checkpoint(suffix="final")
 
@@ -316,22 +351,31 @@ class DPOTrainer:
         return {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()}
 
     def _save_checkpoint(self, suffix: Optional[str] = None) -> None:
+        # Rank 0 writes; all other ranks barrier so a subsequent load sees a
+        # complete file.
+        if not is_main_process():
+            barrier()
+            return
+
         tag = suffix or f"step{self.global_step}"
         path = self.config.output_dir / f"{self.config.run_name}_{tag}.pt"
 
+        # Always save the unwrapped state_dict (no `module.` / `_orig_mod.` prefix).
+        bare_model = unwrap_model(self.model)
         config_dict = None
-        if hasattr(self.model, "config"):
-            config_dict = {k: v for k, v in self.model.config.__dict__.items() if not k.startswith("_")}
+        if hasattr(bare_model, "config"):
+            config_dict = {k: v for k, v in bare_model.config.__dict__.items() if not k.startswith("_")}
 
         save_checkpoint(
             path,
-            model_state=self.model.state_dict(),
+            model_state=bare_model.state_dict(),
             optimizer_state=self.optimizer.state_dict(),
             step=self.global_step,
             run_name=self.config.run_name,
             config=config_dict,
         )
         self.logger.info(f"Saved checkpoint: {path}")
+        barrier()
 
 
 def load_model_from_checkpoint(
@@ -357,18 +401,21 @@ def run_dpo(
     train_config: TrainingConfig,
     dpo_config: DPOConfig,
     preference_config: PreferenceDatasetConfig,
-    tokenizer_name: str = "gpt2",
+    tokenizer_name: str = "Xenova/text-embedding-ada-002",
 ) -> Path:
     """Run DPO training on an SFT model.
 
     Pre: sft_checkpoint exists with valid model state.
     Post: Returns path to final DPO checkpoint.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    init_distributed()
+    device = get_device()
 
-    print(f"Loading SFT model from {sft_checkpoint}")
+    if is_main_process():
+        print(f"Loading SFT model from {sft_checkpoint}")
     model, model_config = load_model_from_checkpoint(sft_checkpoint, device)
-    print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
+    if is_main_process():
+        print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
@@ -382,10 +429,12 @@ def run_dpo(
     )
     print(f"Preference pairs: {len(dataset)}")
 
+    sampler = maybe_distributed_sampler(dataset, shuffle=True, seed=train_config.seed or 42)
     dataloader = DataLoader(
         dataset,
         batch_size=train_config.micro_batch_size,
-        shuffle=True,
+        sampler=sampler,
+        shuffle=False if sampler is not None else True,
         collate_fn=collate_preference_batch,
         num_workers=0,
         pin_memory=True,
@@ -504,7 +553,7 @@ def main() -> None:
         train_config = TrainingConfig(
             run_name=args.run_name,
             dataset_name=args.dataset,
-            tokenizer_name="gpt2",
+            tokenizer_name="Xenova/text-embedding-ada-002",
             output_dir=args.output_dir / args.run_name,
             batch_size=args.batch_size,
             micro_batch_size=args.micro_batch_size,

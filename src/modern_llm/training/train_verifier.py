@@ -25,8 +25,21 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from modern_llm.config import PipelineConfig, TrainingConfig
 from modern_llm.models.verifier import VerifierConfig, VerifierModel
+from modern_llm.training.distributed import (
+    barrier,
+    get_device,
+    init_distributed,
+    is_main_process,
+    maybe_distributed_sampler,
+    seed_everything,
+    unwrap_model,
+    wrap_ddp,
+)
 from modern_llm.utils.checkpointing import save_checkpoint
 from modern_llm.utils.logging_utils import create_logger
+from modern_llm.utils.paths import apply_env_defaults, cache_dir_for_datasets
+
+apply_env_defaults()
 
 
 @dataclass
@@ -69,7 +82,7 @@ class VerifierDataset(Dataset):
         except ImportError as e:
             raise ImportError("datasets package required") from e
 
-        raw = load_dataset(self.config.dataset_name, "main", split=self.config.split)
+        raw = load_dataset(self.config.dataset_name, "main", split=self.config.split, cache_dir=cache_dir_for_datasets())
 
         if self.config.num_examples:
             raw = raw.select(range(min(self.config.num_examples, len(raw))))
@@ -187,15 +200,19 @@ class VerifierTrainer:
         eval_dataloader: Optional[DataLoader] = None,
         lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     ):
-        self.model = model
+        init_distributed()
+        if config.seed is not None:
+            seed_everything(config.seed)
+
         self.optimizer = optimizer
         self.train_dataloader = train_dataloader
         self.config = config
         self.eval_dataloader = eval_dataloader
         self.lr_scheduler = lr_scheduler
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        self.device = get_device()
+        model.to(self.device)
+        self.model = wrap_ddp(model)
 
         self.logger = create_logger(f"verifier.{config.run_name}")
         self.use_amp = config.mixed_precision in {"fp16", "bf16"} and self.device.type == "cuda"
@@ -212,8 +229,17 @@ class VerifierTrainer:
         accumulation_steps = self.config.gradient_accumulation_steps
         max_steps = self.config.max_steps
 
-        with tqdm(total=max_steps, desc="Verifier Training", unit="step") as pbar:
+        epoch = 0
+        with tqdm(
+            total=max_steps,
+            desc="Verifier Training",
+            unit="step",
+            disable=not is_main_process(),
+        ) as pbar:
             while self.global_step < max_steps:
+                sampler = getattr(self.train_dataloader, "sampler", None)
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
                 for batch in self.train_dataloader:
                     prev_step = self.global_step
                     loss, metrics = self._training_step(batch, accumulation_steps)
@@ -225,7 +251,11 @@ class VerifierTrainer:
                     if self.global_step >= max_steps:
                         break
 
-                    if self.config.log_every > 0 and self.global_step % self.config.log_every == 0:
+                    if (
+                        self.config.log_every > 0
+                        and self.global_step % self.config.log_every == 0
+                        and is_main_process()
+                    ):
                         self.logger.info(
                             "step=%d loss=%.4f accuracy=%.2f%% lr=%.3e",
                             self.global_step,
@@ -240,17 +270,19 @@ class VerifierTrainer:
                         and self.global_step % self.config.eval_every == 0
                     ):
                         eval_metrics = self.evaluate()
-                        self.logger.info(
-                            "eval step=%d accuracy=%.2f%%",
-                            self.global_step,
-                            eval_metrics["accuracy"] * 100,
-                        )
+                        if is_main_process():
+                            self.logger.info(
+                                "eval step=%d accuracy=%.2f%%",
+                                self.global_step,
+                                eval_metrics["accuracy"] * 100,
+                            )
 
                     if self.config.save_every > 0 and self.global_step % self.config.save_every == 0:
                         self._save_checkpoint()
 
                 if self.global_step >= max_steps:
                     break
+                epoch += 1
 
         self._save_checkpoint(suffix="final")
 
@@ -330,27 +362,33 @@ class VerifierTrainer:
         return {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()}
 
     def _save_checkpoint(self, suffix: Optional[str] = None) -> None:
+        if not is_main_process():
+            barrier()
+            return
+
         tag = suffix or f"step{self.global_step}"
         path = self.config.output_dir / f"{self.config.run_name}_{tag}.pt"
 
-        config_dict = {k: v for k, v in self.model.config.__dict__.items() if not k.startswith("_")}
+        bare_model = unwrap_model(self.model)
+        config_dict = {k: v for k, v in bare_model.config.__dict__.items() if not k.startswith("_")}
 
         save_checkpoint(
             path,
-            model_state=self.model.state_dict(),
+            model_state=bare_model.state_dict(),
             optimizer_state=self.optimizer.state_dict(),
             step=self.global_step,
             run_name=self.config.run_name,
             config=config_dict,
         )
         self.logger.info(f"Saved checkpoint: {path}")
+        barrier()
 
 
 def run_verifier_training(
     train_config: TrainingConfig,
     verifier_config: VerifierConfig,
     dataset_config: VerifierDatasetConfig,
-    tokenizer_name: str = "gpt2",
+    tokenizer_name: str = "Xenova/text-embedding-ada-002",
     eval_split: Optional[str] = None,
 ) -> Path:
     """Train the verifier model.
@@ -374,10 +412,12 @@ def run_verifier_training(
     train_dataset = VerifierDataset(dataset_config, tokenizer)
     print(f"Training examples: {len(train_dataset)}")
 
+    train_sampler = maybe_distributed_sampler(train_dataset, shuffle=True, seed=train_config.seed or 42)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=train_config.micro_batch_size,
-        shuffle=True,
+        sampler=train_sampler,
+        shuffle=False if train_sampler is not None else True,
         collate_fn=collate_verifier_batch,
         num_workers=0,
         pin_memory=True,
@@ -509,7 +549,7 @@ def main() -> None:
         train_config = TrainingConfig(
             run_name=args.run_name,
             dataset_name="gsm8k",
-            tokenizer_name="gpt2",
+            tokenizer_name="Xenova/text-embedding-ada-002",
             output_dir=args.output_dir / args.run_name,
             batch_size=args.batch_size,
             micro_batch_size=args.micro_batch_size,

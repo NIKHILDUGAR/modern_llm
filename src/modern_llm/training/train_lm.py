@@ -13,8 +13,14 @@ from transformers import AutoTokenizer
 
 from modern_llm.config import ModernLLMConfig, TrainingConfig
 from modern_llm.data import LanguageModelingDatasetConfig, load_causal_lm_dataset, load_multi_dataset
+from modern_llm.data.lm_datasets import make_lm_dataloader
 from modern_llm.models import ModernDecoderLM
+from modern_llm.training.distributed import is_main_process, world_size
 from modern_llm.training.trainer_base import Trainer
+from modern_llm.utils.paths import apply_env_defaults
+
+# Make sure HF cache env defaults are set as soon as this module is imported.
+apply_env_defaults()
 
 
 def _sample_next_token(
@@ -95,13 +101,29 @@ def generate_text(
             attention_mask = torch.ones_like(input_ids, device=device)
 
     return tokenizer.decode(input_ids[0], skip_special_tokens=True)
+import torch.nn as nn
 
+def print_model_parameters(model: nn.Module):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"Total Parameters: {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"Percentage Trainable: {100 * trainable_params / total_params:.4f}%\n")
+    
+    # Optional: Print trainable layers specifically
+    print("Trainable Layers:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"- {name}: {param.shape}")
+
+# Usage:
 
 def run_training(
     model_config: ModernLLMConfig,
     train_config: TrainingConfig,
     dataset_names: Optional[list] = None,
-    tokenizer_name: str = "gpt2",
+    tokenizer_name: str ="Xenova/text-embedding-ada-002",
 ) -> Path:
     """Run pretraining and return path to final checkpoint.
 
@@ -188,26 +210,32 @@ def run_training(
             tokenizer,
         )
 
-    train_loader = DataLoader(
+    # Use the DDP-aware loader builder. Under WORLD_SIZE>1 each rank gets a
+    # disjoint slice via DistributedSampler; otherwise behaves like a normal
+    # shuffled DataLoader.
+    train_loader = make_lm_dataloader(
         train_dataset,
-        batch_size=train_config.micro_batch_size,
+        micro_batch_size=train_config.micro_batch_size,
         shuffle=True,
-        drop_last=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
+        num_workers=16,
+        seed=train_config.seed or 42,
     )
-    eval_loader = DataLoader(
+    eval_loader = make_lm_dataloader(
         eval_dataset,
-        batch_size=train_config.micro_batch_size,
+        micro_batch_size=train_config.micro_batch_size,
         shuffle=False,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=4,
     )
 
     model = ModernDecoderLM(model_config)
-    print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
-
+    if is_main_process():
+        print("=================")
+        print_model_parameters(model)
+        print(
+            f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters "
+            f"(world_size={world_size()})"
+        )
+        print("=================")
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_config.learning_rate,
@@ -243,8 +271,8 @@ def main() -> None:
     parser.add_argument("--run_name", type=str, default="scratch-lm")
     parser.add_argument("--dataset_name", type=str, default="wikitext")
     parser.add_argument("--dataset_config_name", type=str, default="wikitext-2-raw-v1")
-    parser.add_argument("--tokenizer_name", type=str, default="gpt2")
-    parser.add_argument("--max_seq_len", type=int, default=512)
+    parser.add_argument("--tokenizer_name", type=str, default="Xenova/text-embedding-ada-002")
+    parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--n_layers", type=int, default=8)
@@ -321,16 +349,17 @@ def main() -> None:
         tokenizer,
     )
 
-    train_loader = DataLoader(
+    train_loader = make_lm_dataloader(
         train_dataset,
-        batch_size=args.micro_batch_size,
+        micro_batch_size=args.micro_batch_size,
         shuffle=True,
-        drop_last=True,
+        num_workers=0,
     )
-    eval_loader = DataLoader(
+    eval_loader = make_lm_dataloader(
         eval_dataset,
-        batch_size=args.micro_batch_size,
+        micro_batch_size=args.micro_batch_size,
         shuffle=False,
+        num_workers=0,
     )
 
     model_config = ModernLLMConfig(

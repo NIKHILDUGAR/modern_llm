@@ -24,7 +24,21 @@ for p in (str(PROJECT_ROOT), str(SRC_ROOT)):
         sys.path.insert(0, p)
 
 
-DEFAULT_TOKENIZER = "Xenova/text-embedding-ada-002"
+# Tokenizer resolution order (first existing wins, else falls back to HF hub):
+#   1. $MODERN_LLM_TOKENIZER env var — explicit override
+#   2. <repo>/tokenizers/cl_small_bpe_16k — our custom 16k BPE (produced by
+#      scripts/data/train_tokenizer.py). This matches the post-4090 runs.
+#   3. "Xenova/text-embedding-ada-002" — legacy cl100k tokenizer used by the
+#      archived pre-4090 checkpoints; kept so old eval sweeps still load.
+import os as _os
+
+_CUSTOM_BPE_DIR = PROJECT_ROOT / "tokenizers" / "cl_small_bpe_16k"
+if _os.environ.get("MODERN_LLM_TOKENIZER"):
+    DEFAULT_TOKENIZER = _os.environ["MODERN_LLM_TOKENIZER"]
+elif _CUSTOM_BPE_DIR.exists():
+    DEFAULT_TOKENIZER = str(_CUSTOM_BPE_DIR)
+else:
+    DEFAULT_TOKENIZER = "Xenova/text-embedding-ada-002"
 
 
 _VALID_CONFIG_KEYS = {
@@ -39,9 +53,11 @@ _VALID_CONFIG_KEYS = {
 def load_scratch_model(checkpoint_path: str, device: str, tokenizer_name: str = DEFAULT_TOKENIZER):
     """Load a ModernDecoderLM checkpoint + matching tokenizer.
 
-    Mirrors the loader in scripts/evaluation/eval_sst2.py but defaults the
-    tokenizer to the cl100k tokenizer (vocab=100261) actually used by the
-    gpu-full training runs — callers can override with --tokenizer if needed.
+    Tokenizer resolution: see DEFAULT_TOKENIZER at module top. The 16k custom
+    BPE (`tokenizers/cl_small_bpe_16k/`) is preferred when present; it matches
+    the post-4090 runs. Falls back to the legacy cl100k tokenizer for archived
+    pre-4090 checkpoints. Callers can override with --tokenizer or the
+    MODERN_LLM_TOKENIZER env var.
     """
     from modern_llm.config.model_config import ModernLLMConfig
     from modern_llm.models.transformer import ModernDecoderLM

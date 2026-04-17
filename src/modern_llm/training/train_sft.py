@@ -23,8 +23,12 @@ from modern_llm.data.instruction_datasets import (
     load_instruction_dataset,
 )
 from modern_llm.models.transformer import ModernDecoderLM
+from modern_llm.training.distributed import get_device, init_distributed, is_main_process
 from modern_llm.training.trainer_base import Trainer
 from modern_llm.utils.checkpointing import load_checkpoint
+from modern_llm.utils.paths import apply_env_defaults
+
+apply_env_defaults()
 
 
 def load_pretrained_model(
@@ -53,7 +57,7 @@ def run_sft(
     pretrain_checkpoint: Path,
     train_config: TrainingConfig,
     dataset_config: InstructionDatasetConfig,
-    tokenizer_name: str = "gpt2",
+    tokenizer_name: str="Xenova/text-embedding-ada-002",
     eval_split: Optional[str] = None,
 ) -> Path:
     """Run supervised fine-tuning on pretrained model.
@@ -64,12 +68,16 @@ def run_sft(
     Post:
         - Returns path to final SFT checkpoint
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Initialize DDP early so get_device() returns the correct per-rank device.
+    init_distributed()
+    device = get_device()
 
     # Load model
-    print(f"Loading pretrained model from {pretrain_checkpoint}")
+    if is_main_process():
+        print(f"Loading pretrained model from {pretrain_checkpoint}")
     model, model_config = load_pretrained_model(pretrain_checkpoint, device)
-    print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
+    if is_main_process():
+        print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
@@ -220,7 +228,7 @@ def main() -> None:
         train_config = TrainingConfig(
             run_name=args.run_name,
             dataset_name=args.dataset,
-            tokenizer_name="gpt2",
+            tokenizer_name="Xenova/text-embedding-ada-002",
             output_dir=args.output_dir / args.run_name,
             batch_size=args.batch_size,
             micro_batch_size=args.micro_batch_size,
