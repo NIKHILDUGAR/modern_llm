@@ -97,7 +97,7 @@ def main() -> None:
     parser.add_argument("--output_csv", type=str, default="experiments/lm_checkpoint_metrics.csv")
     parser.add_argument("--dataset_name", type=str, default="wikitext")
     parser.add_argument("--dataset_config_name", type=str, default="wikitext-2-raw-v1")
-    parser.add_argument("--tokenizer_name", type=str, default="gpt2")
+    parser.add_argument("--tokenizer_name", type=str, default="Xenova/text-embedding-ada-002")
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_proc", type=int, default=1)

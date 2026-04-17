@@ -32,12 +32,12 @@ class HardwareConfig:
     """
 
     device: str = "auto"
-    num_gpus: int = 1
+    num_gpus: int = 2
     gpu_memory_gb: int = 12
     mixed_precision: MixedPrecisionDtype = "bf16"
     gradient_checkpointing: bool = True
-    is_distributed: bool = False
-    world_size: int = 1
+    is_distributed: bool = True
+    world_size: int = 2
     local_rank: int = 0
 
     def __post_init__(self) -> None:
@@ -49,6 +49,7 @@ class HardwareConfig:
             raise ValueError(f"gpu_memory_gb must be >= 1, got {self.gpu_memory_gb}")
         if self.mixed_precision not in {"bf16", "fp16", "fp32"}:
             raise ValueError(f"mixed_precision must be bf16/fp16/fp32, got {self.mixed_precision}")
+        print(self.num_gpus)
 
     @classmethod
     def from_env(cls) -> HardwareConfig:
@@ -63,11 +64,12 @@ class HardwareConfig:
 
         if torch.cuda.is_available():
             num_gpus = torch.cuda.device_count()
+            print("num_gpus",num_gpus)
             device = f"cuda:{local_rank}" if is_distributed else "cuda"
             if num_gpus > 0:
                 props = torch.cuda.get_device_properties(local_rank if is_distributed else 0)
                 gpu_memory_gb = props.total_memory // (1024**3)
-
+        print("====================================  num_gpus72  ",num_gpus)
         return cls(
             device=device,
             num_gpus=num_gpus,
@@ -99,7 +101,7 @@ class DataConfig:
     tokens_target: int = 50_000_000  # 50M tokens default
     max_epochs: int = 10
     shuffle_buffer: int = 10_000
-    num_workers: int = 4
+    num_workers: int = 16
     prefetch_factor: int = 2
 
     def __post_init__(self) -> None:

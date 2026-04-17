@@ -18,7 +18,7 @@ mkdir -p "$ARCHIVE_DIR"
 
 shopt -s nullglob
 moved=0
-for entry in "$RUNS_DIR"/gpu-full*; do
+for entry in "$RUNS_DIR"/2026*; do
     name="$(basename "$entry")"
     # Skip the archive dir itself.
     if [ "$name" = "gpu-full_archive_pre-4090" ]; then

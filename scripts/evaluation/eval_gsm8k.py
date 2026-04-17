@@ -171,8 +171,8 @@ def evaluate_gsm8k(
     """Evaluate on GSM8K with optional verifier reranking."""
     dataset = load_dataset("gsm8k", "main", split="test")
 
-    if max_samples and len(dataset) > max_samples:
-        dataset = dataset.select(range(max_samples))
+    #if max_samples and len(dataset) > max_samples:
+    #    dataset = dataset.select(range(max_samples))
 
     results_no_verifier = {"correct": 0, "total": 0}
     results_with_verifier = {"correct": 0, "total": 0}
@@ -276,7 +276,7 @@ def main():
         print(f"Loading verifier: {args.verifier}")
         verifier = load_verifier(args.verifier, args.device)
 
-    print(f"Evaluating on GSM8K (max {args.max_samples} samples)...")
+    print(f"Evaluating on GSM8K (max all samples)...")
     results = evaluate_gsm8k(
         model, tokenizer, args.device,
         verifier=verifier,

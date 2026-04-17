@@ -140,8 +140,8 @@ def evaluate_sst2(
     """Evaluate on SST-2 validation set."""
     dataset = load_dataset("glue", "sst2", split="validation")
 
-    if max_samples and len(dataset) > max_samples:
-        dataset = dataset.select(range(max_samples))
+    #if max_samples and len(dataset) > max_samples:
+    #    dataset = dataset.select(range(max_samples))
 
     correct = 0
     total = 0
@@ -193,7 +193,7 @@ def main():
         is_hf = False
 
     # Evaluate
-    print(f"Evaluating on SST-2 (max {args.max_samples} samples)...")
+    print(f"Evaluating on SST-2 (max all samples)...")
     results = evaluate_sst2(model, tokenizer, args.device, args.max_samples, is_hf)
 
     # Add metadata

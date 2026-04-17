@@ -47,13 +47,11 @@ from modern_llm.utils.paths import (  # noqa: E402
 
 apply_env_defaults()
 
-
 # Sources, weights, and how to extract the text field. Tweak weights to bias
 # the merge frequencies toward the domain mix you care about.
 SOURCES = [
     # (hf_name, hf_config, split, text_field, streaming)
     ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text", True),
-    ("bigcode/the-stack-smol", None, "train", "content", False),
     ("open-web-math/open-web-math", None, "train", "text", True),
 ]
 
