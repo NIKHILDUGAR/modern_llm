@@ -618,10 +618,23 @@ upcoming PRs.
    on the manual path). Flag `use_qk_norm` added to `ModernLLMConfig`,
    `AttentionConfig`, `PipelineConfig`, and threaded through `DecoderBlock`.
    Smoke-tested: works with Flash SDPA, GQA, and attention-sinks paths.
-8. **M8 TODO**: Residual init scaling + scaled embeddings + z-loss in
-   `transformer.py` / training loop.
-9. **M9 TODO**: `torch.compile` toggle in `trainer_base.py` (default
-   ON for 4090, OFF for 3060 unless overridden).
+8. **M8 DONE**: Residual init scaling + scaled embeddings + z-loss.
+   Added `scale_embeddings`, `residual_init_scale`, `z_loss_coef` to
+   `ModernLLMConfig`. `transformer.py` now scales token embeddings by
+   `sqrt(d_model)` (gated), rescales per-block `attn.out_proj` and
+   `ffn.proj` init by `1/sqrt(2*n_layers)` after `_init_weights`, and
+   adds PaLM z-loss (`coef * mean(logsumexp(logits)^2)`) to the
+   cross-entropy when `z_loss_coef > 0`. Threaded through
+   `PipelineConfig`; `configs/lm_75m_2x4090.json` sets
+   `scale_embeddings: true`, `z_loss_coef: 1e-4`.
+9. **M9 DONE**: `torch.compile` plumbed end-to-end. `PipelineConfig`
+   has `compile_model: Optional[bool]` (None = auto). Auto resolves ON
+   for compute capability >= (8,9) (Ada 4090 / Hopper), OFF otherwise
+   (so 3060 @ 8.6 stays off by default). Pipeline threads the resolved
+   value into every stage's `TrainingConfig`; `trainer_base.py` already
+   honours `config.compile_model`. `configs/lm_75m_2x4090.json` sets
+   `compile_model: true` explicitly; `configs/lm_max_rtx3060.json`
+   keeps `compile_model: false`.
 10. **M10 TODO**: Turn attention sinks OFF for training in the new
     config (`use_attention_sinks: false`).
 
@@ -656,17 +669,61 @@ upcoming PRs.
 
 ---
 
-## 11. Open questions (resolve before M17)
+## 11. Open questions
 
-1. **Grad-checkpointing + `torch.compile`** interaction on 2x4090: verify
-   in a 200-step smoke that the compiled graph doesn't recompile per
-   step due to dynamic shapes introduced by activation checkpointing.
-2. **Confirm NCCL version on the box** — NCCL <2.18 has known deadlocks
-   with `NCCL_P2P_DISABLE=1` + grad-accum bucket overlap.
-3. **License check** for final model weights: The Stack v2 smol is the
-   usual gotcha; confirm acceptance before publishing.
-4. **Do we ship the 16k tokenizer alongside the model?** Yes, because
-   evals depend on it (it's not a HF Hub tokenizer).
+### Resolved (2026-04-18 smoke on 2x RTX 4090)
+
+1. **Grad-checkpointing + `torch.compile` interaction.** **Resolved: no
+   per-step recompilation.** 50-step 2x4090 DDP smoke with
+   `configs/lm_75m_2x4090_smoke.json` + `TORCH_LOGS=recompiles` emitted
+   zero recompile events after the initial compile. Steady-state
+   throughput ~4.2 step/s at micro_batch=1, seq=4096, grad_ckpt ON. The
+   compiled graph is stable across training steps; grad-ckpt does not
+   introduce dynamic shapes that dynamo retraces.
+2. **NCCL version + `NCCL_P2P_DISABLE=0` on 2x4090.** **Resolved: NCCL
+   2.21.5 on the box (≥ 2.18 floor), and setting
+   `NCCL_P2P_DISABLE=0` is functionally equivalent to `=1` on 4090.**
+   The RTX 4090 driver hardware-disables P2P regardless of the env var —
+   NCCL logs `P2P is disabled between connected GPUs 0 and 1` and falls
+   back to SHM/direct automatically. `ncclCommInitRank` completes cleanly;
+   no hang. The `NCCL_P2P_DISABLE=1` default in `launch.sh` is a
+   belt-and-suspenders hint, not a correctness requirement on 4090.
+
+### Resolved (2026-04-18 HF probe)
+
+3. **The Stack v2 smol access / license check.** **Resolved: gated, not
+   yet granted for the current HF account (`NDugar`).** Probing
+   `bigcode/the-stack-v2-train-smol-ids` with a valid HF token returns
+   `DatasetNotFoundError: Dataset ... is a gated dataset ... Visit the
+   dataset page to ask for access.` Until access is approved, the code
+   slice for pretrain must use a public fallback — `bigcode/the-stack-smol`
+   loads cleanly with the same token (confirmed by probe; downloads to
+   `data/raw/hf_cache/` per the cache policy). Action item before M13:
+   either (a) request + receive Stack v2 smol access on HuggingFace
+   (and re-accept the code license there), or (b) swap
+   `bigcode/the-stack-v2-train-smol-ids` → `bigcode/the-stack-smol`
+   (+ an OpenCoder/Stack v1 variant) in `configs/lm_75m_2x4090.json`
+   and `scripts/data/download_pretrain_mix.py` before downloading.
+4. **Ship the 16k tokenizer alongside the model.** **Resolved: yes.**
+   Tokenizer artifact at `tokenizers/cl_small_bpe_16k/` (loadable via
+   `AutoTokenizer.from_pretrained`) ships with every release — both
+   eval scripts and downstream users need it since it is not on HF Hub.
+
+### Side findings from the smoke (not blockers)
+
+- NaN loss observed at steps 20/25/50 with `lr=3e-3` + `warmup_steps=5`
+  on a fresh init. Expected under such aggressive warmup; does not
+  reproduce at production `warmup_steps=2000`. Keep an eye on loss
+  trajectory during the first 200 opt steps of the real pretrain.
+- `scripts/run_pipeline.py::_maybe_self_spawn_under_torchrun` leaves the
+  bare `N` from `--nproc-per-node N` as an extra positional arg after
+  flag stripping, so torchrun-reexec fails. Workaround for now: call
+  `torchrun --standalone --nproc_per_node=N scripts/run_pipeline.py ...`
+  directly, or use `--nproc-per-node=N` (equals sign) on the wrapper.
+- `scripts/launch.sh` fails in this container because `numactl` errors
+  out on `set_mempolicy: Operation not permitted` and `set -e` kills the
+  exec chain. Workaround: run torchrun directly with env vars inlined
+  until numactl can be skipped or capabilities granted.
 
 ---
 
