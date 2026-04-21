@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +14,11 @@ from transformers import AutoTokenizer
 
 from modern_llm.config import ModernLLMConfig, TrainingConfig
 from modern_llm.data import LanguageModelingDatasetConfig, load_causal_lm_dataset, load_multi_dataset
-from modern_llm.data.lm_datasets import make_lm_dataloader
+from modern_llm.data.lm_datasets import (
+    load_packed_pretrain_dataset,
+    load_packed_pretrain_train_eval_split,
+    make_lm_dataloader,
+)
 from modern_llm.models import ModernDecoderLM
 from modern_llm.training.distributed import is_main_process, world_size
 from modern_llm.training.trainer_base import Trainer
@@ -124,17 +129,24 @@ def run_training(
     train_config: TrainingConfig,
     dataset_names: Optional[list] = None,
     tokenizer_name: str ="Xenova/text-embedding-ada-002",
+    packed_shards_dir: Optional[str] = None,
+    packed_eval_windows: int = 256,
 ) -> Path:
     """Run pretraining and return path to final checkpoint.
 
     Pre: model_config and train_config are valid.
     Post: Returns path to final checkpoint file.
-    
+
     Args:
         model_config: Model architecture config
         train_config: Training hyperparameters
-        dataset_names: List of dataset names to train on. If None, uses WikiText-2.
-        tokenizer_name: Tokenizer to use
+        dataset_names: List of dataset names to train on (HF streaming path).
+            Ignored when `packed_shards_dir` is provided.
+        tokenizer_name: Tokenizer to use.
+        packed_shards_dir: If set, read packed uint32 shards produced by
+            scripts/data/tokenize_pretrain.py from this directory instead of
+            streaming raw HF datasets. Expected layout: <dir>/index.json +
+            <dir>/shard_*.bin.
     """
     # Default to WikiText-2 if no datasets specified
     if dataset_names is None:
@@ -145,30 +157,27 @@ def run_training(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.model_max_length = model_config.max_seq_len
 
-    # Update vocab size from tokenizer
-    model_config = ModernLLMConfig(
-        vocab_size=tokenizer.vocab_size,
-        d_model=model_config.d_model,
-        n_layers=model_config.n_layers,
-        n_heads=model_config.n_heads,
-        ffn_hidden_size=model_config.ffn_hidden_size,
-        max_seq_len=model_config.max_seq_len,
-        dropout=model_config.dropout,
-        use_rope=model_config.use_rope,
-        use_attention_sinks=model_config.use_attention_sinks,
-        num_attention_sinks=model_config.num_attention_sinks,
-        use_swiglu=model_config.use_swiglu,
-        tie_embeddings=model_config.tie_embeddings,
-        use_gqa=model_config.use_gqa,
-        gqa_groups=model_config.gqa_groups,
-        use_moe=model_config.use_moe,
-        moe_config=model_config.moe_config,
-    )
+    # Update vocab size from tokenizer while preserving every other field
+    # (QK-norm, z_loss_coef, scale_embeddings, rope_theta, ...) — rebuilding
+    # field-by-field silently dropped those in earlier versions.
+    from dataclasses import replace as _dc_replace
+    model_config = _dc_replace(model_config, vocab_size=tokenizer.vocab_size)
 
     # Load training data (single or multiple datasets)
     from modern_llm.data.lm_datasets import DATASET_REGISTRY
-    
-    if len(dataset_names) == 1 and dataset_names[0] in ["wikitext-2-raw-v1", "wikitext-103-raw-v1"]:
+
+    if packed_shards_dir:
+        if is_main_process():
+            print(f"Loading packed pretrain shards from: {packed_shards_dir}")
+        # Hold out the last `packed_eval_windows` windows as eval so the
+        # eval distribution matches training (same tokenizer, same packing,
+        # no padding, no attention-mask-zero rows that produce NaN softmax).
+        train_dataset, eval_dataset = load_packed_pretrain_train_eval_split(
+            packed_shards_dir,
+            seq_len=model_config.max_seq_len,
+            eval_windows=packed_eval_windows,
+        )
+    elif len(dataset_names) == 1 and dataset_names[0] in ["wikitext-2-raw-v1", "wikitext-103-raw-v1"]:
         # Single wikitext dataset - use original loader for validation split
         hf_name, hf_config, _ = DATASET_REGISTRY[dataset_names[0]]
         train_dataset = load_causal_lm_dataset(
@@ -242,13 +251,18 @@ def run_training(
         weight_decay=train_config.weight_decay,
     )
 
-    scheduler = None
-    if train_config.warmup_steps > 0:
-        def lr_lambda(step: int) -> float:
-            if step < train_config.warmup_steps:
-                return float(step + 1) / float(train_config.warmup_steps)
-            return 1.0
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    warm = max(train_config.warmup_steps, 1)
+    total = max(train_config.max_steps, warm + 1)
+    min_ratio = train_config.min_lr_ratio
+
+    def lr_lambda(step: int) -> float:
+        if step < train_config.warmup_steps:
+            return float(step + 1) / float(warm)
+        progress = (step - warm) / max(total - warm, 1)
+        progress = min(max(progress, 0.0), 1.0)
+        return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     trainer = Trainer(
         model=model,

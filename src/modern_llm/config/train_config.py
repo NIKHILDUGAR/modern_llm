@@ -28,6 +28,7 @@ class TrainingConfig:
     learning_rate: float
     max_steps: int
     warmup_steps: int = 0
+    min_lr_ratio: float = 0.1
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     eval_every: int = 500
@@ -55,6 +56,8 @@ class TrainingConfig:
             raise ValueError(f"learning_rate must be positive, received {self.learning_rate}")
         if self.weight_decay < 0:
             raise ValueError(f"weight_decay must be non-negative, received {self.weight_decay}")
+        if not 0.0 <= self.min_lr_ratio <= 1.0:
+            raise ValueError(f"min_lr_ratio must be in [0,1], received {self.min_lr_ratio}")
         if self.max_grad_norm <= 0:
             raise ValueError(f"max_grad_norm must be positive, received {self.max_grad_norm}")
         if self.mixed_precision not in {"bf16", "fp16", "fp32"}:

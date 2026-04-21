@@ -50,6 +50,44 @@ _VALID_CONFIG_KEYS = {
 }
 
 
+class _HFCausalLMAdapter(torch.nn.Module):
+    """Wrap a HF CausalLM so it mimics ModernDecoderLM's forward interface.
+
+    Eval scripts expect `model(input_ids)["logits"]` and `model.config.max_seq_len`.
+    HF models return `CausalLMOutputWithPast.logits` and advertise max length via
+    `config.max_position_embeddings` (GPT-2) or `config.max_position_embeddings`
+    (SmolLM2). This shim bridges the two without touching any eval_*.py.
+    """
+
+    def __init__(self, hf_model) -> None:
+        super().__init__()
+        self.hf = hf_model
+        hf_cfg = hf_model.config
+
+        class _Cfg:
+            pass
+
+        cfg = _Cfg()
+        cfg.max_seq_len = int(getattr(hf_cfg, "max_position_embeddings", None)
+                              or getattr(hf_cfg, "n_positions", 1024))
+        cfg.vocab_size = int(hf_cfg.vocab_size)
+        self.config = cfg
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        out = self.hf(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        return {"logits": out.logits, "loss": getattr(out, "loss", None)}
+
+
+def _looks_like_hf_id(spec: str) -> bool:
+    # HF IDs are "org/name" or well-known bare names ("gpt2"); checkpoints are .pt/.bin/.safetensors files
+    p = Path(spec)
+    if p.exists() and p.is_file():
+        return False
+    if spec.endswith((".pt", ".bin", ".safetensors", ".ckpt")):
+        return False
+    return True
+
+
 def load_scratch_model(checkpoint_path: str, device: str, tokenizer_name: str = DEFAULT_TOKENIZER):
     """Load a ModernDecoderLM checkpoint + matching tokenizer.
 
@@ -58,9 +96,27 @@ def load_scratch_model(checkpoint_path: str, device: str, tokenizer_name: str = 
     the post-4090 runs. Falls back to the legacy cl100k tokenizer for archived
     pre-4090 checkpoints. Callers can override with --tokenizer or the
     MODERN_LLM_TOKENIZER env var.
+
+    If `checkpoint_path` doesn't point at a local file, it's treated as a HF
+    model id (e.g. "gpt2", "HuggingFaceTB/SmolLM2-135M") and loaded via
+    transformers. The returned model wraps the HF forward to match the
+    scratch model's `{"logits", "loss"}` dict interface.
     """
     from modern_llm.config.model_config import ModernLLMConfig
     from modern_llm.models.transformer import ModernDecoderLM
+
+    if _looks_like_hf_id(checkpoint_path):
+        from transformers import AutoModelForCausalLM
+        hf_model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+        hf_model.to(device)
+        hf_model.eval()
+        model = _HFCausalLMAdapter(hf_model)
+        # Tokenizer: prefer explicit override, else use the HF model's own tokenizer.
+        tok_name = tokenizer_name if tokenizer_name and tokenizer_name != DEFAULT_TOKENIZER else checkpoint_path
+        tokenizer = AutoTokenizer.from_pretrained(tok_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        return model, tokenizer
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 

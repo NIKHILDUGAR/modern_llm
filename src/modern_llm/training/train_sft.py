@@ -59,14 +59,21 @@ def run_sft(
     dataset_config: InstructionDatasetConfig,
     tokenizer_name: str="Xenova/text-embedding-ada-002",
     eval_split: Optional[str] = None,
+    train_dataset: Optional[torch.utils.data.Dataset] = None,
 ) -> Path:
     """Run supervised fine-tuning on pretrained model.
 
     Pre:
         - pretrain_checkpoint exists with valid model state
-        - dataset specified in dataset_config is accessible
+        - dataset specified in dataset_config is accessible,
+          OR a pre-built `train_dataset` is supplied (e.g. an
+          SFTMixtureDataset from build_sft_mixture).
     Post:
         - Returns path to final SFT checkpoint
+
+    When `train_dataset` is provided, `dataset_config.dataset_name` is
+    ignored for training data loading (it is still used for the eval
+    split if `eval_split` is provided).
     """
     # Initialize DDP early so get_device() returns the correct per-rank device.
     init_distributed()
@@ -85,8 +92,11 @@ def run_sft(
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load datasets
-    print(f"Loading instruction dataset: {dataset_config.dataset_name}")
-    train_dataset = load_instruction_dataset(dataset_config, tokenizer)
+    if train_dataset is None:
+        print(f"Loading instruction dataset: {dataset_config.dataset_name}")
+        train_dataset = load_instruction_dataset(dataset_config, tokenizer)
+    else:
+        print(f"Using pre-built train_dataset ({type(train_dataset).__name__})")
     print(f"Training examples: {len(train_dataset)}")
 
     train_dataloader = create_instruction_dataloader(

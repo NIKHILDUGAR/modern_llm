@@ -50,13 +50,12 @@ def evaluate_bbq(model, tokenizer, device: str, max_samples_per_cat: int) -> dic
         ds = load_dataset("heegyu/bbq")
     except Exception:
         ds = load_dataset("Elfsong/BBQ")
-    # Combine splits (BBQ is a collection of category configs, but this one flattens them)
+    # BBQ on Elfsong/BBQ is split by social category (age, gender, race, ...),
+    # not train/test. Concatenate every split so we evaluate the whole benchmark.
     if "test" in ds:
-        data = ds["test"]
+        data = list(ds["test"])
     else:
-        # Pick the first split available
-        key = list(ds.keys())[0]
-        data = ds[key]
+        data = [ex for split in ds.keys() for ex in ds[split]]
 
     by_cat = defaultdict(lambda: {"correct": 0, "total": 0, "ambig_correct": 0, "ambig_total": 0,
                                   "disambig_correct": 0, "disambig_total": 0})
@@ -76,7 +75,9 @@ def evaluate_bbq(model, tokenizer, device: str, max_samples_per_cat: int) -> dic
         prompt = build_prompt(ex)
         choices = [f" {letter}" for letter in LETTERS]
         pred = mc_argmax(model, tokenizer, prompt, choices, device, length_normalize=False)
-        gold = int(ex["label"])
+        # Schema varies across mirrors: Elfsong/BBQ uses "answer_label"; older
+        # flattened mirrors use "label". Fall back through the aliases.
+        gold = int(ex.get("answer_label", ex.get("label", 0)))
         cat = ex.get("category", "all")
         is_correct = int(pred == gold)
         by_cat[cat]["correct"] += is_correct

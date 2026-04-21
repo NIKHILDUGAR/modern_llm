@@ -202,21 +202,10 @@ def main():
 
     print(f"\nSST-2 Accuracy: {results['accuracy']:.2%} ({results['correct']}/{results['total']})")
 
-    # Save results
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Append to existing results if present
-    if output_path.exists():
-        with open(output_path) as f:
-            all_results = json.load(f)
-    else:
-        all_results = []
-
-    all_results.append(results)
-
     with open(output_path, "w") as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(results, f, indent=2)
 
     print(f"Results saved to {output_path}")
     return 0

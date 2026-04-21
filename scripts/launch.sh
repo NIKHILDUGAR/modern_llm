@@ -52,16 +52,9 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 # ---- NUMA / CPU pinning -----------------------------------------------------
 # Match the user's known-good launcher template. Override NUMA_NODE if you
 # need a different socket. If `numactl` is missing we just skip pinning.
-NUMA_NODE="${NUMA_NODE:-1}"
-if command -v numactl >/dev/null 2>&1; then
-    NUMA_PREFIX=(numactl --cpunodebind="$NUMA_NODE" --membind="$NUMA_NODE")
-else
-    echo "[launch.sh] WARNING: numactl not found; running without NUMA pinning" >&2
-    NUMA_PREFIX=()
-fi
 
 # ---- Run --------------------------------------------------------------------
 # We always invoke `python3 scripts/run_pipeline.py ...` — run_pipeline.py
 # self-spawns under torchrun when --nproc-per-node > 1.
 cd "$REPO_ROOT"
-exec "${NUMA_PREFIX[@]}" python3 scripts/run_pipeline.py "$@"
+exec  numactl --cpunodebind=1  python3 scripts/run_pipeline.py "$@"

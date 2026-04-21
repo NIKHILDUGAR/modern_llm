@@ -11,6 +11,7 @@ This module documents the math/architecture before Phase 1 fleshes out the code.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -102,6 +103,21 @@ class ModernDecoderLM(nn.Module):
         if config.tie_embeddings:
             self.lm_head.weight = self.token_embed.weight
         self.apply(self._init_weights)
+        if config.residual_init_scale:
+            self._apply_residual_init_scale()
+
+    def _apply_residual_init_scale(self) -> None:
+        # Megatron-style: scale residual-path output projections by 1/sqrt(2*n_layers)
+        # so the variance at depth L stays O(1) regardless of depth.
+        scale = 1.0 / math.sqrt(2.0 * self.config.n_layers)
+        for block in self.blocks:
+            attn_out = getattr(block.attn, "out_proj", None)
+            if isinstance(attn_out, nn.Linear):
+                attn_out.weight.data.mul_(scale)
+            ffn = block.ffn
+            ffn_out = getattr(ffn, "proj", None)
+            if isinstance(ffn_out, nn.Linear):
+                ffn_out.weight.data.mul_(scale)
 
     def forward(
         self,
@@ -134,6 +150,8 @@ class ModernDecoderLM(nn.Module):
         attention_mask = attention_mask.to(dtype=torch.float32)
 
         hidden_states = self.token_embed(input_ids)
+        if self.config.scale_embeddings:
+            hidden_states = hidden_states * math.sqrt(self.config.d_model)
         hidden_states = self.dropout(hidden_states)
 
         attention_bias = self._build_attention_bias(attention_mask, hidden_states.dtype)
@@ -149,11 +167,16 @@ class ModernDecoderLM(nn.Module):
                 raise ValueError("labels must have the same shape as input_ids")
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            flat_logits = shift_logits.view(-1, self.config.vocab_size)
+            flat_labels = shift_labels.view(-1)
+            loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
+            if self.config.z_loss_coef > 0.0:
+                # PaLM §5.1 z-loss: penalize log(Z)^2 to keep the logit partition
+                # function near 1, which stabilizes bf16 without fp32 softmax.
+                valid = flat_labels != -100
+                if valid.any():
+                    log_z = torch.logsumexp(flat_logits[valid], dim=-1)
+                    loss = loss + self.config.z_loss_coef * log_z.pow(2).mean()
 
         return {"logits": logits, "loss": loss}
 

@@ -64,14 +64,16 @@ class Trainer:
         if self.config.seed is not None:
             seed_everything(self.config.seed)
 
-        # 2. Place model on the per-rank device, then optionally compile + DDP.
+        # 2. Place model on the per-rank device, then DDP + optional compile.
+        # PyTorch recommends DDP-then-compile so inductor fuses through the
+        # AllReduce hooks rather than graph-breaking at them.
         self.device = get_device()
         self.logger = create_logger(f"trainer.{self.config.run_name}")
         self.model.to(self.device)
-        if self.config.compile_model and hasattr(torch, "compile"):
-            self.model = torch.compile(self.model)  # type: ignore[attr-defined]
         # NOTE: wrap_ddp returns the bare model when WORLD_SIZE<=1.
         self.model = wrap_ddp(self.model)
+        if self.config.compile_model and hasattr(torch, "compile"):
+            self.model = torch.compile(self.model)  # type: ignore[attr-defined]
 
         # 3. AMP setup. bf16 needs no GradScaler; fp16 does.
         self.use_amp = self.config.mixed_precision in {"fp16", "bf16"} and self.device.type == "cuda"
@@ -161,15 +163,21 @@ class Trainer:
 
     def _training_step(self, batch: Dict[str, Tensor], accumulation_steps: int) -> float:
         batch = self._move_batch_to_device(batch)
-        micro_loss = self._forward_loss(batch) / accumulation_steps
+        raw_loss = self._forward_loss(batch)
+        micro_loss = raw_loss / accumulation_steps
 
         if self.use_amp and self.scaler is not None:
             self.scaler.scale(micro_loss).backward()
         else:
             micro_loss.backward()
 
+        # Accumulate raw CE across micro-batches so the step-level log reports
+        # mean(raw_loss), not the final micro-batch's (raw_loss / accum).
+        self._accum_loss_sum = getattr(self, "_accum_loss_sum", 0.0) + float(raw_loss.detach().cpu())
+
         self.micro_step += 1
         step_completed = self.micro_step % accumulation_steps == 0
+        reported_loss = float(raw_loss.detach().cpu())
         if step_completed:
             if self.use_amp and self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
@@ -183,9 +191,11 @@ class Trainer:
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
+            reported_loss = self._accum_loss_sum / accumulation_steps
+            self._accum_loss_sum = 0.0
             self.global_step += 1
 
-        return float(micro_loss.detach().cpu())
+        return reported_loss
 
     def _forward_loss(self, batch: Dict[str, Tensor]) -> Tensor:
         autocast_dtype = None
@@ -208,21 +218,39 @@ class Trainer:
         if not self.eval_dataloader:
             return {"loss": float("nan"), "perplexity": float("nan")}
         self.model.eval()
-        total_loss = torch.zeros(1, device=self.device)
-        total_batches = torch.zeros(1, device=self.device)
+        # fp32 accumulators: bf16 underflows/overflows in reduction easily.
+        total_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
+        total_batches = torch.zeros(1, device=self.device, dtype=torch.float32)
+        skipped = 0
         with torch.no_grad():
             for batch in self.eval_dataloader:
                 batch = self._move_batch_to_device(batch)
-                loss = self._forward_loss(batch)
-                total_loss += loss.detach()
+                loss = self._forward_loss(batch).detach().float()
+                if not torch.isfinite(loss):
+                    skipped += 1
+                    continue
+                total_loss += loss
                 total_batches += 1
 
         # Reduce so all ranks see identical eval numbers.
         if is_distributed():
             torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(total_batches, op=torch.distributed.ReduceOp.SUM)
+            skipped_t = torch.tensor([skipped], device=self.device, dtype=torch.float32)
+            torch.distributed.all_reduce(skipped_t, op=torch.distributed.ReduceOp.SUM)
+            skipped = int(skipped_t.item())
 
-        avg_loss = float((total_loss / torch.clamp(total_batches, min=1)).item())
+        counted = float(total_batches.item())
+        if counted == 0.0:
+            if is_main_process():
+                self.logger.warning("eval: every batch produced non-finite loss; skipped=%d", skipped)
+            self.model.train()
+            return {"loss": float("nan"), "perplexity": float("inf")}
+
+        if skipped > 0 and is_main_process():
+            self.logger.warning("eval: skipped %d non-finite batch losses", skipped)
+
+        avg_loss = float((total_loss / total_batches).item())
         perplexity = math.exp(avg_loss) if avg_loss < 20 else float("inf")
         self.model.train()
         return {"loss": avg_loss, "perplexity": perplexity}

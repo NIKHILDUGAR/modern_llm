@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
 # Apply HF cache redirects as soon as we know where the repo is. Done
 # *before* any HF import so cache settings stick.
 from modern_llm.utils.paths import apply_env_defaults  # noqa: E402
@@ -135,6 +134,7 @@ def run_pretrain(config: PipelineConfig, output_dir: Path) -> Path:
         train_config,
         dataset_names=dataset_names,
         tokenizer_name=config.tokenizer_name,
+        packed_shards_dir=config.pretrain_packed_shards,
     )
 
 
@@ -376,8 +376,12 @@ Stages:
         print(f"Using config preset: {args.config}")
         config = get_pipeline_preset(args.config)
     # Apply overrides
+    from datetime import datetime
+
+# Get current time
+    now = datetime.now()
     if args.run_name:
-        config.run_name = args.run_name
+        config.run_name = args.run_name+str(now)
     if args.max_steps:
         config.pretrain_max_steps = args.max_steps
         config.sft_max_steps = min(args.max_steps, config.sft_max_steps)

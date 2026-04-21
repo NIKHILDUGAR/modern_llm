@@ -40,6 +40,10 @@ class PipelineConfig:
     gqa_groups: Optional[int] = 2
     use_qk_norm: bool = False
     use_moe: bool = False
+    scale_embeddings: bool = False
+    residual_init_scale: bool = True
+    z_loss_coef: float = 0.0
+    compile_model: Optional[bool] = None
 
     # Hardware
     hardware_preset: str = "auto"
@@ -47,8 +51,14 @@ class PipelineConfig:
     # Data scale
     data_preset: str = "small"
     
-    # Pretrain datasets (list of dataset names from DATASET_REGISTRY)
+    # Pretrain datasets (list of dataset names from DATASET_REGISTRY).
+    # Used when `pretrain_packed_shards` is not set.
     pretrain_datasets: Optional[List[str]] = None
+
+    # If set, pretrain reads packed uint32 shards from this directory
+    # (produced by scripts/data/tokenize_pretrain.py) instead of streaming
+    # + tokenizing raw HF datasets. Takes precedence over pretrain_datasets.
+    pretrain_packed_shards: Optional[str] = None
 
     # Pretraining
     pretrain_max_steps: int = 20000
@@ -56,6 +66,10 @@ class PipelineConfig:
     pretrain_batch_size: int = 2
     pretrain_micro_batch_size: int = 2
     pretrain_warmup_steps: int = 500
+    pretrain_min_lr_ratio: float = 0.1
+    # Number of windows held out from the tail of the packed shards as eval.
+    # Only used when `pretrain_packed_shards` is set. Eval tokens = N * max_seq_len.
+    pretrain_eval_windows: int = 256
 
     # SFT
     sft_max_steps: int = 5000
@@ -64,6 +78,9 @@ class PipelineConfig:
     sft_micro_batch_size: int = 2
     sft_dataset: str = "tatsu-lab/alpaca"
     sft_datasets: Optional[List[str]] = None  # Multiple SFT datasets (overrides sft_dataset)
+    # Interleave probabilities for `sft_datasets` (must match its length, normalized to sum to 1.0).
+    # When None, all listed datasets get equal weight.
+    sft_dataset_weights: Optional[List[float]] = None
 
     # DPO
     dpo_max_steps: int = 2000
@@ -127,7 +144,23 @@ class PipelineConfig:
             use_qk_norm=self.use_qk_norm,
             use_moe=self.use_moe,
             moe_config=moe_config,
+            scale_embeddings=self.scale_embeddings,
+            residual_init_scale=self.residual_init_scale,
+            z_loss_coef=self.z_loss_coef,
         )
+
+    def _resolve_compile_model(self) -> bool:
+        """Default ON for Ada/Hopper+ (cap >= 8.9); OFF for Ampere/older. Overridable."""
+        if self.compile_model is not None:
+            return self.compile_model
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return False
+            major, minor = torch.cuda.get_device_capability()
+            return (major, minor) >= (8, 9)
+        except Exception:
+            return False
 
     def get_hardware_config(self) -> HardwareConfig:
         """Get hardware config from preset or auto-detect."""
@@ -150,12 +183,14 @@ class PipelineConfig:
             learning_rate=self.pretrain_lr,
             max_steps=self.pretrain_max_steps,
             warmup_steps=self.pretrain_warmup_steps,
+            min_lr_ratio=self.pretrain_min_lr_ratio,
             weight_decay=0.1,
             eval_every=self.eval_every,
             save_every=self.save_every,
             log_every=self.log_every,
             seed=self.seed,
             mixed_precision=self.mixed_precision,  # type: ignore
+            compile_model=self._resolve_compile_model(),
         )
 
     def get_sft_config(self) -> TrainingConfig:
@@ -177,6 +212,7 @@ class PipelineConfig:
             log_every=self.log_every,
             seed=self.seed,
             mixed_precision=self.mixed_precision,  # type: ignore
+            compile_model=self._resolve_compile_model(),
         )
 
     def get_dpo_config(self) -> TrainingConfig:
@@ -198,6 +234,7 @@ class PipelineConfig:
             log_every=self.log_every,
             seed=self.seed,
             mixed_precision=self.mixed_precision,  # type: ignore
+            compile_model=self._resolve_compile_model(),
         )
 
     def get_verifier_config(self) -> TrainingConfig:
@@ -219,6 +256,7 @@ class PipelineConfig:
             log_every=self.log_every,
             seed=self.seed,
             mixed_precision=self.mixed_precision,  # type: ignore
+            compile_model=self._resolve_compile_model(),
         )
 
     def to_dict(self) -> dict[str, Any]:

@@ -213,29 +213,66 @@ class AlignmentPipeline:
         # Pass datasets from config (defaults to wikitext-2 if not specified)
         dataset_names = self.config.pretrain_datasets
         checkpoint = run_training(
-            model_config, 
-            train_config, 
+            model_config,
+            train_config,
             dataset_names=dataset_names,
             tokenizer_name=self.config.tokenizer_name,
+            packed_shards_dir=self.config.pretrain_packed_shards,
+            packed_eval_windows=self.config.pretrain_eval_windows,
         )
         return checkpoint
 
     def _run_sft(self) -> Path:
-        """Run SFT stage."""
+        """Run SFT stage.
+
+        If `config.sft_datasets` is a non-empty list, build an interleaved
+        mixture via `build_sft_mixture` with optional `sft_dataset_weights`
+        (uniform if unset). Otherwise fall back to the single-dataset path
+        defined by `config.sft_dataset`.
+        """
         train_config = self.config.get_sft_config()
         # Override output_dir to use checkpoint_dir
         train_config.output_dir = self.checkpoint_dir / train_config.run_name
         train_config.output_dir.mkdir(parents=True, exist_ok=True)
+
+        use_mixture = bool(self.config.sft_datasets)
+
+        # dataset_config is still required by run_sft's signature and drives
+        # the eval split when present. For the mixture path we point it at
+        # the first listed dataset so eval has a concrete source.
+        primary_name = (
+            self.config.sft_datasets[0] if use_mixture else self.config.sft_dataset
+        )
         dataset_config = InstructionDatasetConfig(
-            dataset_name=self.config.sft_dataset,
+            dataset_name=primary_name,
             max_length=self.config.max_seq_len,
         )
+
+        pre_built_dataset = None
+        if use_mixture:
+            from modern_llm.data.sft_mixture import build_sft_mixture
+
+            tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_name)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            self.logger.info(
+                f"Building SFT mixture over {len(self.config.sft_datasets)} "
+                f"datasets (weights={'uniform' if self.config.sft_dataset_weights is None else self.config.sft_dataset_weights})"
+            )
+            pre_built_dataset = build_sft_mixture(
+                dataset_names=self.config.sft_datasets,
+                weights=self.config.sft_dataset_weights,
+                tokenizer=tokenizer,
+                max_length=self.config.max_seq_len,
+                seed=self.config.seed,
+            )
 
         return run_sft(
             pretrain_checkpoint=self.state.pretrain_checkpoint,
             train_config=train_config,
             dataset_config=dataset_config,
             tokenizer_name=self.config.tokenizer_name,
+            train_dataset=pre_built_dataset,
         )
 
     def _run_dpo(self) -> Path:

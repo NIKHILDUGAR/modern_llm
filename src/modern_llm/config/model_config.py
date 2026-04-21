@@ -59,6 +59,9 @@ class ModernLLMConfig:
     use_moe: bool = False
     moe_config: Optional[MoEConfig] = None
     tie_embeddings: bool = True
+    scale_embeddings: bool = False
+    residual_init_scale: bool = True
+    z_loss_coef: float = 0.0
 
     def __post_init__(self) -> None:
         self._validate_dimensions()
@@ -88,6 +91,8 @@ class ModernLLMConfig:
             raise ValueError(f"rmsnorm_eps must be positive, received {self.rmsnorm_eps}")
         if self.initializer_range <= 0:
             raise ValueError(f"initializer_range must be positive, received {self.initializer_range}")
+        if self.z_loss_coef < 0:
+            raise ValueError(f"z_loss_coef must be non-negative, received {self.z_loss_coef}")
 
     def _validate_attention_settings(self) -> None:
         if self.use_attention_sinks and self.num_attention_sinks <= 0:
