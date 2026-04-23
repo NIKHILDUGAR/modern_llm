@@ -1,4 +1,7 @@
 # Modern LLM
+The README is to be updated post achieving its goal in training.
+The following is the old README from the ORIGINAL PROJECT, This current version has no updated README as of yet hence keeping this here for some understanding of what the project contains. 
+
 A from-scratch implementation of a **frontier-style LLM training pipeline**, demonstrating modern architectural choices (RoPE, RMSNorm, SwiGLU, attention sinks) and a complete alignment workflow (Pretrain → SFT → DPO → Verifier). Trained a 253M parameter model that achieves **27.03 perplexity** on WikiText-2, outperforming GPT-2 (124M) at 40.64.
 
 Read the detailed documentation here: https://aymanmahfuz27-modern_llm.mintlify.app/architecture/overview
