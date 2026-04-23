@@ -18,6 +18,7 @@ from .pipeline_config import (
     gpu_full_config,
     gpu_smoke_config,
 )
+from modern_llm.quantization import QuantizationConfig
 from .train_config import TrainingConfig
 
 __all__ = [
@@ -36,5 +37,6 @@ __all__ = [
     "local_smoke_config",
     "gpu_full_config",
     "gpu_smoke_config",
+    "QuantizationConfig",
     "TrainingConfig",
 ]

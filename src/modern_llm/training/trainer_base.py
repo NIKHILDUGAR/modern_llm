@@ -73,6 +73,11 @@ class Trainer:
         # NOTE: wrap_ddp returns the bare model when WORLD_SIZE<=1.
         self.model = wrap_ddp(self.model)
         if self.config.compile_model and hasattr(torch, "compile"):
+            # python_reducer avoids the C++ DDP reducer's _broadcast_coalesced
+            # call that dynamo cannot trace, which otherwise graph-breaks the
+            # compiled region at every forward entry.
+            import torch._dynamo
+            torch._dynamo.config.optimize_ddp = "python_reducer"
             self.model = torch.compile(self.model)  # type: ignore[attr-defined]
 
         # 3. AMP setup. bf16 needs no GradScaler; fp16 does.

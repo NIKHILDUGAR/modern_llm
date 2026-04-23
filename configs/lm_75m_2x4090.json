@@ -1,10 +1,9 @@
 {
   "run_name": "lm-75m-2x4090",
   "output_dir": "experiments/runs/lm-75m-2x4090",
-
   "vocab_size": 16000,
   "d_model": 512,
-  "n_layers": 18,
+  "n_layers": 20,
   "n_heads": 8,
   "ffn_hidden_size": 1408,
   "max_seq_len": 4096,
@@ -19,25 +18,29 @@
   "gqa_groups": 2,
   "use_qk_norm": true,
   "use_moe": false,
-
+  "scale_embeddings": true,
+  "residual_init_scale": true,
+  "z_loss_coef": 1e-4,
+  "compile_model": true,
   "hardware_preset": "auto",
   "data_preset": "xl",
   "tokenizer_name": "tokenizers/cl_small_bpe_16k",
-
   "pretrain_datasets": [
     "HuggingFaceFW/fineweb-edu",
     "mlfoundations/dclm-baseline-1.0",
-    "bigcode/the-stack-v2-train-smol-ids",
     "open-web-math/open-web-math",
     "wikimedia/wikipedia",
-    "EleutherAI/pile"
+    "togethercomputer/RedPajama-Data-1T:stackexchange",
+    "togethercomputer/RedPajama-Data-1T:arxiv"
   ],
-  "pretrain_max_steps": 76000,
-  "pretrain_lr": 3e-3,
+  "pretrain_packed_shards": "data/tokenized/pretrain_mix",
+  "pretrain_max_steps": 196000,
+  "pretrain_lr": 2e-3,
   "pretrain_batch_size": 32,
   "pretrain_micro_batch_size": 4,
-  "pretrain_warmup_steps": 2000,
-
+  "pretrain_warmup_steps": 4000,
+  "pretrain_min_lr_ratio": 0.1,
+  "pretrain_eval_windows": 4096,
   "sft_max_steps": 4000,
   "sft_lr": 5e-5,
   "sft_batch_size": 32,
@@ -61,7 +64,7 @@
   "dpo_beta": 0.05,
   "dpo_dataset": "HuggingFaceH4/ultrafeedback_binarized",
 
-  "verifier_max_steps": 2000,
+  "verifier_max_steps": 20,
   "verifier_lr": 1e-4,
   "verifier_batch_size": 32,
   "verifier_micro_batch_size": 4,
@@ -69,6 +72,6 @@
   "seed": 42,
   "mixed_precision": "bf16",
   "eval_every": 5000,
-  "save_every": 2000,
+  "save_every": 5000,
   "log_every": 50
 }
