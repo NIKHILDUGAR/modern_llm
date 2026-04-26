@@ -20,7 +20,8 @@ from modern_llm.data.lm_datasets import (
     make_lm_dataloader,
 )
 from modern_llm.models import ModernDecoderLM
-from modern_llm.training.distributed import is_main_process, world_size
+from modern_llm.quantization import prepare_model_for_quantization
+from modern_llm.training.distributed import is_main_process, scale_grad_accum_for_world_size, world_size
 from modern_llm.training.trainer_base import Trainer
 from modern_llm.utils.paths import apply_env_defaults
 
@@ -237,6 +238,14 @@ def run_training(
     )
 
     model = ModernDecoderLM(model_config)
+    if train_config.quantization is not None and train_config.quantization.enabled:
+        train_config.compile_model = False
+        summary = prepare_model_for_quantization(model, train_config.quantization)
+        if is_main_process():
+            print(
+                f"Quantization enabled: mode={summary.mode} "
+                f"replaced_modules={len(summary.replaced_modules)}"
+            )
     if is_main_process():
         print("=================")
         print_model_parameters(model)
@@ -395,7 +404,10 @@ def main() -> None:
         output_dir=output_dir,
         batch_size=args.batch_size,
         micro_batch_size=args.micro_batch_size,
-        gradient_accumulation_steps=args.batch_size // args.micro_batch_size,
+        gradient_accumulation_steps=scale_grad_accum_for_world_size(
+            args.batch_size,
+            args.micro_batch_size,
+        ),
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,

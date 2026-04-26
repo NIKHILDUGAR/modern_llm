@@ -21,10 +21,11 @@ from typing import Optional
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
-# Add src to path
+# Add local eval helpers and src to path
+sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+from _eval_common import DEFAULT_TOKENIZER, load_scratch_model
 
 
 def extract_answer(text: str) -> Optional[str]:
@@ -81,30 +82,6 @@ def classify_error(question: str, pred: str, gold: str, model_output: str) -> st
         pass
     
     return "reasoning"
-
-
-def load_scratch_model(checkpoint_path: str, device: str):
-    """Load scratch model from checkpoint."""
-    from modern_llm.config.model_config import ModernLLMConfig
-    from modern_llm.models.transformer import ModernDecoderLM
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    if "config" in checkpoint:
-        config = ModernLLMConfig(**checkpoint["config"])
-    else:
-        config = ModernLLMConfig()
-
-    model = ModernDecoderLM(config)
-    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model", checkpoint))
-    model.load_state_dict(state_dict, strict=False)
-    model.to(device)
-    model.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, tokenizer
 
 
 def load_verifier(verifier_path: str, device: str):
@@ -171,8 +148,8 @@ def evaluate_gsm8k(
     """Evaluate on GSM8K with optional verifier reranking."""
     dataset = load_dataset("gsm8k", "main", split="test")
 
-    #if max_samples and len(dataset) > max_samples:
-    #    dataset = dataset.select(range(max_samples))
+    if max_samples and len(dataset) > max_samples:
+        dataset = dataset.select(range(max_samples))
 
     results_no_verifier = {"correct": 0, "total": 0}
     results_with_verifier = {"correct": 0, "total": 0}
@@ -261,6 +238,7 @@ def evaluate_gsm8k(
 def main():
     parser = argparse.ArgumentParser(description="GSM8K evaluation with verifier")
     parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint")
+    parser.add_argument("--tokenizer", type=str, default=DEFAULT_TOKENIZER)
     parser.add_argument("--verifier", type=str, help="Verifier checkpoint (optional)")
     parser.add_argument("--max-samples", type=int, default=100)
     parser.add_argument("--n-samples", type=int, default=1, help="Solutions per question")
@@ -269,7 +247,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading model: {args.checkpoint}")
-    model, tokenizer = load_scratch_model(args.checkpoint, args.device)
+    model, tokenizer = load_scratch_model(args.checkpoint, args.device, args.tokenizer)
 
     verifier = None
     if args.verifier:
@@ -310,4 +288,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -12,7 +12,8 @@ This module documents the math/architecture before Phase 1 fleshes out the code.
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Iterator, Optional
 
 import torch
 from torch import Tensor, nn
@@ -20,8 +21,21 @@ import torch.nn.functional as F
 
 from modern_llm.config.model_config import ModernLLMConfig
 from modern_llm.models.attention import AttentionConfig, MultiHeadAttention
+from modern_llm.models.gated_deltanet import GatedDeltaNet, GatedDeltaNetConfig
 from modern_llm.models.layers import RMSNorm, SwiGLU
 from modern_llm.models.moe import MixtureOfExperts
+
+
+@dataclass(frozen=True)
+class QuantizableLinearRef:
+    """Stable reference to a linear layer that can be quantized opt-in."""
+
+    module_path: str
+    parent: nn.Module
+    attr_name: str
+    module: nn.Linear
+    block_index: Optional[int]
+    group: str
 
 
 class DecoderBlock(nn.Module):
@@ -43,23 +57,36 @@ class DecoderBlock(nn.Module):
         - Residual connections keep tensor dimensionality constant.
     """
 
-    def __init__(self, config: ModernLLMConfig) -> None:
+    def __init__(self, config: ModernLLMConfig, layer_index: int) -> None:
         super().__init__()
-        attn_config = AttentionConfig(
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            use_rope=config.use_rope,
-            rope_theta=config.rope_theta,
-            rope_scaling=config.rope_scaling,
-            use_attention_sinks=config.use_attention_sinks,
-            num_attention_sinks=config.num_attention_sinks,
-            use_gqa=config.use_gqa,
-            gqa_groups=config.gqa_groups,
-            use_qk_norm=config.use_qk_norm,
-            qk_norm_eps=config.rmsnorm_eps,
-            dropout=config.dropout,
-        )
-        self.attn = MultiHeadAttention(attn_config)
+        self.layer_index = layer_index
+        self.uses_gated_deltanet = config.uses_gated_deltanet_layer(layer_index)
+        if self.uses_gated_deltanet:
+            self.gated_deltanet = GatedDeltaNet(
+                GatedDeltaNetConfig(
+                    d_model=config.d_model,
+                    num_heads=config.gated_deltanet_num_heads or config.n_heads,
+                    conv_kernel=config.gated_deltanet_conv_kernel,
+                    dropout=config.dropout,
+                    rmsnorm_eps=config.rmsnorm_eps,
+                )
+            )
+        else:
+            attn_config = AttentionConfig(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                use_rope=config.use_rope,
+                rope_theta=config.rope_theta,
+                rope_scaling=config.rope_scaling,
+                use_attention_sinks=config.use_attention_sinks,
+                num_attention_sinks=config.num_attention_sinks,
+                use_gqa=config.use_gqa,
+                gqa_groups=config.gqa_groups,
+                use_qk_norm=config.use_qk_norm,
+                qk_norm_eps=config.rmsnorm_eps,
+                dropout=config.dropout,
+            )
+            self.attn = MultiHeadAttention(attn_config)
         self.attn_norm = RMSNorm(config.d_model, config.rmsnorm_eps)
         self.ffn_norm = RMSNorm(config.d_model, config.rmsnorm_eps)
         hidden = config.ffn_hidden_size
@@ -69,9 +96,17 @@ class DecoderBlock(nn.Module):
             self.ffn = SwiGLU(config.d_model, hidden, out_features=config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, hidden_states: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         attn_input = self.attn_norm(hidden_states)
-        attn_output = self.attn(attn_input, attention_mask=attention_mask)
+        if self.uses_gated_deltanet:
+            attn_output = self.gated_deltanet(attn_input, padding_mask=padding_mask)
+        else:
+            attn_output = self.attn(attn_input, attention_mask=attention_mask)
         hidden_states = hidden_states + self.dropout(attn_output)
 
         ffn_input = self.ffn_norm(hidden_states)
@@ -95,9 +130,12 @@ class ModernDecoderLM(nn.Module):
     def __init__(self, config: ModernLLMConfig) -> None:
         super().__init__()
         self.config = config
+        self._quantization_metadata: Optional[dict] = None
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([DecoderBlock(config) for _ in range(config.n_layers)])
+        self.blocks = nn.ModuleList(
+            [DecoderBlock(config, layer_index=i) for i in range(config.n_layers)]
+        )
         self.final_norm = RMSNorm(config.d_model, config.rmsnorm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
@@ -111,9 +149,12 @@ class ModernDecoderLM(nn.Module):
         # so the variance at depth L stays O(1) regardless of depth.
         scale = 1.0 / math.sqrt(2.0 * self.config.n_layers)
         for block in self.blocks:
-            attn_out = getattr(block.attn, "out_proj", None)
+            attn_out = getattr(getattr(block, "attn", None), "out_proj", None)
             if isinstance(attn_out, nn.Linear):
                 attn_out.weight.data.mul_(scale)
+            gated_out = getattr(getattr(block, "gated_deltanet", None), "out_proj", None)
+            if isinstance(gated_out, nn.Linear):
+                gated_out.weight.data.mul_(scale)
             ffn = block.ffn
             ffn_out = getattr(ffn, "proj", None)
             if isinstance(ffn_out, nn.Linear):
@@ -154,9 +195,10 @@ class ModernDecoderLM(nn.Module):
             hidden_states = hidden_states * math.sqrt(self.config.d_model)
         hidden_states = self.dropout(hidden_states)
 
+        padding_mask = attention_mask.to(dtype=hidden_states.dtype)
         attention_bias = self._build_attention_bias(attention_mask, hidden_states.dtype)
         for block in self.blocks:
-            hidden_states = block(hidden_states, attention_bias)
+            hidden_states = block(hidden_states, attention_bias, padding_mask=padding_mask)
 
         hidden_states = self.final_norm(hidden_states)
         logits = self.lm_head(hidden_states)
@@ -201,3 +243,51 @@ class ModernDecoderLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
 
+    def iter_quantizable_linear_layers(self) -> Iterator[QuantizableLinearRef]:
+        """Yield stable references for opt-in low-bit replacement."""
+
+        for block_idx, block in enumerate(self.blocks):
+            attn = getattr(block, "attn", None)
+            for attr_name in ("q_proj", "k_proj", "v_proj", "out_proj"):
+                module = getattr(attn, attr_name, None)
+                if isinstance(module, nn.Linear):
+                    yield QuantizableLinearRef(
+                        module_path=f"blocks.{block_idx}.attn.{attr_name}",
+                        parent=block.attn,
+                        attr_name=attr_name,
+                        module=module,
+                        block_index=block_idx,
+                        group="attention",
+                    )
+            gated_deltanet = getattr(block, "gated_deltanet", None)
+            for attr_name in ("q_proj", "k_proj", "v_proj", "g_proj", "a_proj", "b_proj", "out_proj"):
+                module = getattr(gated_deltanet, attr_name, None)
+                if isinstance(module, nn.Linear):
+                    yield QuantizableLinearRef(
+                        module_path=f"blocks.{block_idx}.gated_deltanet.{attr_name}",
+                        parent=gated_deltanet,
+                        attr_name=attr_name,
+                        module=module,
+                        block_index=block_idx,
+                        group="gated_deltanet",
+                    )
+            for attr_name in ("gate", "proj"):
+                module = getattr(block.ffn, attr_name, None)
+                if isinstance(module, nn.Linear):
+                    yield QuantizableLinearRef(
+                        module_path=f"blocks.{block_idx}.ffn.{attr_name}",
+                        parent=block.ffn,
+                        attr_name=attr_name,
+                        module=module,
+                        block_index=block_idx,
+                        group="ffn",
+                    )
+        if isinstance(self.lm_head, nn.Linear):
+            yield QuantizableLinearRef(
+                module_path="lm_head",
+                parent=self,
+                attr_name="lm_head",
+                module=self.lm_head,
+                block_index=None,
+                group="lm_head",
+            )

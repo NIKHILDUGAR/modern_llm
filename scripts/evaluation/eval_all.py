@@ -74,9 +74,9 @@ TASKS: List[EvalTask] = [
     EvalTask("squad_v2",       "eval_squad_v2.py",       ["f1", "exact_match"],
              sample_flag="--max-samples", fast_sample_cap=200),
     EvalTask("sst2",           "eval_sst2.py",           ["accuracy", "acc"],
-             sample_flag="--max-samples", fast_sample_cap=500, supports_tokenizer=False),
+             sample_flag="--max-samples", fast_sample_cap=500),
     EvalTask("gsm8k",          "eval_gsm8k.py",          ["accuracy", "pass@1"],
-             sample_flag="--max-samples", fast_sample_cap=50, supports_tokenizer=False),
+             sample_flag="--max-samples", fast_sample_cap=50),
 ]
 
 
@@ -183,7 +183,7 @@ def main() -> int:
         # incremental write so partial progress is durable
         summary_path.write_text(json.dumps({
             "checkpoint": args.checkpoint, "tokenizer": args.tokenizer,
-            "device": args.device, "fast": False,
+            "device": args.device, "fast": args.fast,
             "tasks": results,
             "total_elapsed_s": time.time() - t_start,
         }, indent=2))

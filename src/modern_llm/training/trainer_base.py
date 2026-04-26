@@ -36,6 +36,7 @@ from modern_llm.training.distributed import (
     world_size,
     wrap_ddp,
 )
+from modern_llm.quantization import get_quantization_payload, set_quantization_step
 from modern_llm.utils.checkpointing import save_checkpoint
 from modern_llm.utils.logging_utils import create_logger
 
@@ -76,8 +77,8 @@ class Trainer:
             # python_reducer avoids the C++ DDP reducer's _broadcast_coalesced
             # call that dynamo cannot trace, which otherwise graph-breaks the
             # compiled region at every forward entry.
-            import torch._dynamo
-            torch._dynamo.config.optimize_ddp = "python_reducer"
+            from torch import _dynamo as torch_dynamo
+            torch_dynamo.config.optimize_ddp = "python_reducer"
             self.model = torch.compile(self.model)  # type: ignore[attr-defined]
 
         # 3. AMP setup. bf16 needs no GradScaler; fp16 does.
@@ -167,6 +168,8 @@ class Trainer:
         self._save_checkpoint(suffix="final")
 
     def _training_step(self, batch: Dict[str, Tensor], accumulation_steps: int) -> float:
+        if self.config.quantization is not None and self.config.quantization.enabled:
+            set_quantization_step(unwrap_model(self.model), self.global_step)
         batch = self._move_batch_to_device(batch)
         raw_loss = self._forward_loss(batch)
         micro_loss = raw_loss / accumulation_steps
@@ -289,14 +292,21 @@ class Trainer:
         config_obj = getattr(model_for_state, "config", None)
         if config_obj is not None and hasattr(config_obj, "__dict__"):
             config_dict = {k: v for k, v in config_obj.__dict__.items() if not k.startswith("_")}
+        quantization_payload = get_quantization_payload(model_for_state)
+
+        checkpoint_metadata = {
+            "step": self.global_step,
+            "run_name": self.config.run_name,
+            "config": config_dict,
+        }
+        if quantization_payload is not None:
+            checkpoint_metadata["quantization"] = quantization_payload
 
         save_checkpoint(
             path,
             model_state=model_for_state.state_dict(),
             optimizer_state=self.optimizer.state_dict(),
-            step=self.global_step,
-            run_name=self.config.run_name,
-            config=config_dict,
+            **checkpoint_metadata,
         )
 
         from modern_llm.training.distributed import barrier

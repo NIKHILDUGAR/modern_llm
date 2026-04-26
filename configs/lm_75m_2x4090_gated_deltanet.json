@@ -1,11 +1,11 @@
 {
-  "run_name": "lm-75m-2x4090",
-  "output_dir": "experiments/runs/lm-75m-2x4090",
+  "run_name": "lm-75m-2x4090-gated-deltanet",
+  "output_dir": "experiments/runs/lm-75m-2x4090-gated-deltanet",
   "vocab_size": 16000,
   "d_model": 512,
-  "n_layers": 20,
+  "n_layers": 22,
   "n_heads": 8,
-  "ffn_hidden_size": 1408,
+  "ffn_hidden_size": 1536,
   "max_seq_len": 4096,
   "dropout": 0.0,
 
@@ -21,7 +21,11 @@
   "scale_embeddings": true,
   "residual_init_scale": true,
   "z_loss_coef": 1e-4,
-  "compile_model": true,
+  "sequence_mixer": "hybrid_gated_deltanet",
+  "gated_deltanet_layers": [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 20],
+  "gated_deltanet_num_heads": 8,
+  "gated_deltanet_conv_kernel": 4,
+  "compile_model": false,
   "hardware_preset": "auto",
   "data_preset": "xl",
   "tokenizer_name": "tokenizers/cl_small_bpe_16k",
@@ -34,13 +38,14 @@
     "togethercomputer/RedPajama-Data-1T:arxiv"
   ],
   "pretrain_packed_shards": "data/tokenized/pretrain_mix_40b_balanced",
-  "pretrain_max_steps": 256000,
+  "pretrain_max_steps": 305176,
   "pretrain_lr": 3e-3,
   "pretrain_batch_size": 32,
   "pretrain_micro_batch_size": 4,
   "pretrain_warmup_steps": 4000,
   "pretrain_min_lr_ratio": 0.1,
   "pretrain_eval_windows": 4096,
+
   "sft_max_steps": 20000,
   "sft_lr": 5e-5,
   "sft_batch_size": 32,
@@ -57,7 +62,7 @@
     "stanfordnlp/coqa"
   ],
 
-  "dpo_max_steps": 5000,
+  "dpo_max_steps": 3000,
   "dpo_lr": 3e-6,
   "dpo_batch_size": 16,
   "dpo_micro_batch_size": 4,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import random
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Iterable, Optional
 
 import numpy as np
@@ -60,13 +61,13 @@ def _set_default_nccl_env() -> None:
     - NCCL_P2P_DISABLE=1: RTX 4090 / 3090 do not support P2P over PCIe;
       leaving it on causes silent hangs.
     - NCCL_IB_DISABLE=1: most consumer boxes have no InfiniBand.
-    - NCCL_ASYNC_ERROR_HANDLING=1: turn NCCL hangs into actionable
+    - TORCH_NCCL_ASYNC_ERROR_HANDLING=1: turn NCCL hangs into actionable
       Python exceptions instead of indefinite waits.
     Users can override any of these by setting them before launch.
     """
     os.environ.setdefault("NCCL_P2P_DISABLE", "1")
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 
 
 def init_distributed(backend: str = "nccl") -> None:
@@ -91,8 +92,20 @@ def init_distributed(backend: str = "nccl") -> None:
         torch.cuda.set_device(local_rank())
 
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend)
+        timeout_minutes = int(os.environ.get("TORCH_DISTRIBUTED_TIMEOUT_MINUTES", "60"))
+        dist.init_process_group(
+            backend=backend,
+            timeout=timedelta(minutes=timeout_minutes),
+        )
     _INITIALIZED = True
+
+
+def _dist_barrier() -> None:
+    """Barrier with explicit CUDA device for NCCL process groups."""
+    if torch.cuda.is_available() and str(dist.get_backend()).lower() == "nccl":
+        dist.barrier(device_ids=[local_rank()])
+    else:
+        dist.barrier()
 
 
 def cleanup_distributed() -> None:
@@ -195,12 +208,12 @@ def main_process_first():
     """
     if is_distributed() and dist.is_initialized():
         if not is_main_process():
-            dist.barrier()
+            _dist_barrier()
         try:
             yield
         finally:
             if is_main_process():
-                dist.barrier()
+                _dist_barrier()
     else:
         yield
 
@@ -208,7 +221,7 @@ def main_process_first():
 def barrier() -> None:
     """A no-op barrier when not distributed."""
     if is_distributed() and dist.is_initialized():
-        dist.barrier()
+        _dist_barrier()
 
 
 def scale_grad_accum_for_world_size(

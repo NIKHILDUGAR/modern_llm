@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
+from modern_llm.quantization import QuantizationConfig
+
 
 MixedPrecisionDtype = Literal["bf16", "fp16", "fp32"]
 
@@ -38,8 +40,11 @@ class TrainingConfig:
     mixed_precision: MixedPrecisionDtype = "bf16"
     gradient_checkpointing: bool = True
     compile_model: bool = True  # Significant speedup on modern GPUs
+    quantization: Optional[QuantizationConfig] = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.quantization, dict):
+            self.quantization = QuantizationConfig.from_dict(self.quantization)
         self._validate_positive_int("batch_size", self.batch_size)
         self._validate_positive_int("micro_batch_size", self.micro_batch_size)
         self._validate_positive_int("gradient_accumulation_steps", self.gradient_accumulation_steps)
@@ -75,4 +80,3 @@ class TrainingConfig:
     def _validate_non_negative_int(name: str, value: int) -> None:
         if value < 0:
             raise ValueError(f"{name} must be non-negative, received {value}")
-

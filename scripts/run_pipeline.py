@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import shutil
 import sys
@@ -40,6 +41,24 @@ from modern_llm.config import PipelineConfig, get_pipeline_preset  # noqa: E402
 
 
 VALID_STAGES = {"pretrain", "sft", "dpo", "verifier", "eval", "all"}
+
+
+def _infer_sft_examples_per_dataset(config: PipelineConfig, dataset_count: int) -> int:
+    """Infer a practical per-source cap for SFT mixtures.
+
+    SFT only consumes roughly max_steps * global_batch examples. Loading full
+    multi-million-row instruction sources before a 4k-step run can look like a
+    hang, so cap each source to the amount needed for this run unless the config
+    explicitly chooses a cap.
+    """
+    if dataset_count <= 0:
+        raise ValueError("dataset_count must be positive")
+    if config.sft_num_examples_per_dataset is not None:
+        if config.sft_num_examples_per_dataset <= 0:
+            raise ValueError("sft_num_examples_per_dataset must be positive when set")
+        return config.sft_num_examples_per_dataset
+    examples_needed = max(1, config.sft_max_steps * config.sft_batch_size)
+    return max(1024, math.ceil(examples_needed / dataset_count))
 
 
 def _maybe_self_spawn_under_torchrun(nproc_per_node: int) -> None:
@@ -141,22 +160,54 @@ def run_pretrain(config: PipelineConfig, output_dir: Path) -> Path:
 def run_sft(config: PipelineConfig, output_dir: Path, pretrain_checkpoint: Path) -> Path:
     """Run SFT stage."""
     from modern_llm.data.instruction_datasets import InstructionDatasetConfig
+    from modern_llm.training.distributed import init_distributed, is_main_process, main_process_first
     from modern_llm.training.train_sft import run_sft as _run_sft
+    from transformers import AutoTokenizer
 
     train_config = config.get_sft_config()
     train_config.output_dir = output_dir / train_config.run_name
     train_config.output_dir.mkdir(parents=True, exist_ok=True)
 
+    use_mixture = bool(config.sft_datasets)
+    primary_name = config.sft_datasets[0] if use_mixture else config.sft_dataset
     dataset_config = InstructionDatasetConfig(
-        dataset_name=config.sft_dataset,
+        dataset_name=primary_name,
         max_length=config.max_seq_len,
     )
+
+    train_dataset = None
+    if use_mixture:
+        from modern_llm.data.sft_mixture import build_sft_mixture
+
+        init_distributed()
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        examples_per_dataset = _infer_sft_examples_per_dataset(config, len(config.sft_datasets))
+        with main_process_first():
+            if is_main_process():
+                print(
+                    f"Building SFT mixture over {len(config.sft_datasets)} datasets "
+                    f"(weights={'uniform' if config.sft_dataset_weights is None else config.sft_dataset_weights}, "
+                    f"cap_per_dataset={examples_per_dataset})",
+                    flush=True,
+                )
+            train_dataset = build_sft_mixture(
+                dataset_names=config.sft_datasets,
+                weights=config.sft_dataset_weights,
+                tokenizer=tokenizer,
+                max_length=config.max_seq_len,
+                seed=config.seed,
+                num_examples_per_dataset=examples_per_dataset,
+                log_fn=(lambda msg: print(msg, flush=True)) if is_main_process() else None,
+            )
 
     return _run_sft(
         pretrain_checkpoint=pretrain_checkpoint,
         train_config=train_config,
         dataset_config=dataset_config,
         tokenizer_name=config.tokenizer_name,
+        train_dataset=train_dataset,
     )
 
 
@@ -183,6 +234,7 @@ def run_dpo(config: PipelineConfig, output_dir: Path, sft_checkpoint: Path) -> P
         dpo_config=dpo_config,
         preference_config=preference_config,
         tokenizer_name=config.tokenizer_name,
+        num_examples=config.dpo_num_examples,
     )
 
 
@@ -339,10 +391,46 @@ Stages:
         help="Override DPO max steps",
     )
     parser.add_argument(
+        "--verifier-steps",
+        type=int,
+        default=None,
+        help="Override verifier max steps",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="Override model/data max sequence length.",
+    )
+    parser.add_argument(
+        "--pretrain-eval-windows",
+        type=int,
+        default=None,
+        help="Override packed pretrain eval windows.",
+    )
+    parser.add_argument(
+        "--sft-num-examples-per-dataset",
+        type=int,
+        default=None,
+        help="Override per-source SFT mixture cap.",
+    )
+    parser.add_argument(
+        "--dpo-num-examples",
+        type=int,
+        default=None,
+        help="Override DPO preference pair cap.",
+    )
+    parser.add_argument(
         "--pretrain-datasets",
         type=str,
         default=None,
         help="Comma-separated list of pretrain datasets",
+    )
+    parser.add_argument(
+        "--pretrain-packed-shards",
+        type=str,
+        default=None,
+        help="Override config.pretrain_packed_shards (useful for packed-shard smoke subsets).",
     )
     parser.add_argument(
         "--force",
@@ -393,8 +481,20 @@ Stages:
         config.sft_max_steps = args.sft_steps
     if args.dpo_steps:
         config.dpo_max_steps = args.dpo_steps
+    if args.verifier_steps:
+        config.verifier_max_steps = args.verifier_steps
     if args.pretrain_datasets:
         config.pretrain_datasets = [d.strip() for d in args.pretrain_datasets.split(",")]
+    if args.pretrain_packed_shards:
+        config.pretrain_packed_shards = args.pretrain_packed_shards
+    if args.max_seq_len:
+        config.max_seq_len = args.max_seq_len
+    if args.pretrain_eval_windows is not None:
+        config.pretrain_eval_windows = args.pretrain_eval_windows
+    if args.sft_num_examples_per_dataset is not None:
+        config.sft_num_examples_per_dataset = args.sft_num_examples_per_dataset
+    if args.dpo_num_examples is not None:
+        config.dpo_num_examples = args.dpo_num_examples
 
     # Set output directory
     output_dir = args.output_dir or Path("experiments/runs") / config.run_name
@@ -481,4 +581,3 @@ Stages:
 
 if __name__ == "__main__":
     main()
-

@@ -8,7 +8,7 @@ SwiGLU, GQA, MoE) discussed in those papers.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -62,11 +62,16 @@ class ModernLLMConfig:
     scale_embeddings: bool = False
     residual_init_scale: bool = True
     z_loss_coef: float = 0.0
+    sequence_mixer: str = "attention"
+    gated_deltanet_layers: Optional[List[int]] = None
+    gated_deltanet_num_heads: Optional[int] = None
+    gated_deltanet_conv_kernel: int = 4
 
     def __post_init__(self) -> None:
         self._validate_dimensions()
         self._validate_attention_settings()
         self._validate_moe_settings()
+        self._validate_sequence_mixer_settings()
 
     def _validate_dimensions(self) -> None:
         if self.vocab_size <= 0:
@@ -116,3 +121,44 @@ class ModernLLMConfig:
         if not self.use_moe and self.moe_config is not None:
             raise ValueError("moe_config should be None when use_moe is False")
 
+    def _validate_sequence_mixer_settings(self) -> None:
+        allowed = {"attention", "gated_deltanet", "hybrid_gated_deltanet"}
+        if self.sequence_mixer not in allowed:
+            raise ValueError(
+                f"sequence_mixer must be one of {sorted(allowed)}, received {self.sequence_mixer!r}"
+            )
+        if self.gated_deltanet_conv_kernel <= 0:
+            raise ValueError(
+                f"gated_deltanet_conv_kernel must be positive, received {self.gated_deltanet_conv_kernel}"
+            )
+
+        delta_heads = self.gated_deltanet_num_heads or self.n_heads
+        if delta_heads <= 0 or self.d_model % delta_heads != 0:
+            raise ValueError(
+                f"gated_deltanet_num_heads must be positive and divide d_model "
+                f"(gated_deltanet_num_heads={delta_heads}, d_model={self.d_model})"
+            )
+
+        if self.gated_deltanet_layers is None:
+            if self.sequence_mixer == "hybrid_gated_deltanet":
+                raise ValueError(
+                    "gated_deltanet_layers must be provided when sequence_mixer='hybrid_gated_deltanet'"
+                )
+            return
+
+        if len(set(self.gated_deltanet_layers)) != len(self.gated_deltanet_layers):
+            raise ValueError("gated_deltanet_layers must not contain duplicates")
+        for layer_idx in self.gated_deltanet_layers:
+            if layer_idx < 0 or layer_idx >= self.n_layers:
+                raise ValueError(
+                    f"gated_deltanet layer index {layer_idx} is outside [0, {self.n_layers})"
+                )
+
+    def uses_gated_deltanet_layer(self, layer_index: int) -> bool:
+        """Return whether a decoder block should use the opt-in Gated DeltaNet mixer."""
+
+        if self.sequence_mixer == "attention":
+            return False
+        if self.sequence_mixer == "gated_deltanet":
+            return True
+        return layer_index in set(self.gated_deltanet_layers or [])

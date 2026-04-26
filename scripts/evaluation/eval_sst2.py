@@ -15,15 +15,15 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Add src to path
+# Add local eval helpers and src to path
+sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+from _eval_common import DEFAULT_TOKENIZER, load_scratch_model
 
 
 # Few-shot prompt template - using question format (70% accuracy vs 50% for simple)
@@ -42,58 +42,9 @@ Review: "{text}"
 Answer:"""
 
 
-def load_scratch_model(checkpoint_path: str, device: str):
-    """Load our scratch-trained model from checkpoint."""
-    from modern_llm.config.model_config import ModernLLMConfig
-    from modern_llm.models.transformer import ModernDecoderLM
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Extract config from checkpoint, normalizing any key name variations
-    if "config" in checkpoint:
-        cfg = checkpoint["config"].copy()
-        # Handle key name variations between different config versions
-        if "num_layers" in cfg and "n_layers" not in cfg:
-            cfg["n_layers"] = cfg.pop("num_layers")
-        if "max_position_embeddings" in cfg and "max_seq_len" not in cfg:
-            cfg["max_seq_len"] = cfg.pop("max_position_embeddings")
-        # Remove any keys that ModernLLMConfig doesn't accept
-        valid_keys = {
-            "vocab_size", "d_model", "n_layers", "n_heads", "ffn_hidden_size",
-            "max_seq_len", "rmsnorm_eps", "dropout", "initializer_range",
-            "rope_theta", "rope_scaling", "use_rope", "use_attention_sinks",
-            "num_attention_sinks", "use_swiglu", "swiglu_multiplier", "use_gqa",
-            "gqa_groups", "use_moe", "moe_config", "tie_embeddings",
-        }
-        cfg = {k: v for k, v in cfg.items() if k in valid_keys}
-        config = ModernLLMConfig(**cfg)
-    else:
-        config = ModernLLMConfig()
-
-    model = ModernDecoderLM(config)
-    
-    # Handle different checkpoint formats
-    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model", checkpoint))
-    model.load_state_dict(state_dict, strict=False)
-    model.to(device)
-    model.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, tokenizer
-
-
-def load_hf_model(model_name: str, device: str):
-    """Load a HuggingFace model for baseline comparison."""
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, tokenizer
+def load_hf_model(model_name: str, device: str, tokenizer_name: str = DEFAULT_TOKENIZER):
+    """Load a HuggingFace model through the shared eval adapter."""
+    return load_scratch_model(model_name, device, tokenizer_name)
 
 
 def predict_sentiment(
@@ -105,8 +56,10 @@ def predict_sentiment(
 ) -> str:
     """Predict sentiment for a single example using next-token prediction."""
     prompt = FEW_SHOT_PROMPT.format(text=text)
-    
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    model_config = getattr(model, "config", None)
+    max_length = int(getattr(model_config, "max_seq_len", 512))
+    max_length = max(8, min(max_length, 512))
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
@@ -140,8 +93,8 @@ def evaluate_sst2(
     """Evaluate on SST-2 validation set."""
     dataset = load_dataset("glue", "sst2", split="validation")
 
-    #if max_samples and len(dataset) > max_samples:
-    #    dataset = dataset.select(range(max_samples))
+    if max_samples and len(dataset) > max_samples:
+        dataset = dataset.select(range(max_samples))
 
     correct = 0
     total = 0
@@ -172,6 +125,7 @@ def main():
     parser = argparse.ArgumentParser(description="SST-2 few-shot evaluation")
     parser.add_argument("--checkpoint", type=str, help="Path to scratch model checkpoint")
     parser.add_argument("--hf-model", type=str, help="HuggingFace model name (e.g., gpt2)")
+    parser.add_argument("--tokenizer", type=str, default=DEFAULT_TOKENIZER)
     parser.add_argument("--max-samples", type=int, default=500, help="Max samples to evaluate")
     parser.add_argument("--output", type=str, default="experiments/results/sst2_results.json")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -183,12 +137,12 @@ def main():
     # Load model
     if args.hf_model:
         print(f"Loading HF model: {args.hf_model}")
-        model, tokenizer = load_hf_model(args.hf_model, args.device)
+        model, tokenizer = load_hf_model(args.hf_model, args.device, args.tokenizer)
         model_name = args.hf_model
-        is_hf = True
+        is_hf = False
     else:
         print(f"Loading scratch model: {args.checkpoint}")
-        model, tokenizer = load_scratch_model(args.checkpoint, args.device)
+        model, tokenizer = load_scratch_model(args.checkpoint, args.device, args.tokenizer)
         model_name = Path(args.checkpoint).stem
         is_hf = False
 
@@ -213,4 +167,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

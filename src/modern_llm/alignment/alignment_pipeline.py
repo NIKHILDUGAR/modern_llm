@@ -16,6 +16,7 @@ This module provides the full pipeline orchestration:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,7 @@ from modern_llm.data.instruction_datasets import InstructionDatasetConfig
 from modern_llm.data.preference_datasets import PreferenceDatasetConfig
 from modern_llm.models.transformer import ModernDecoderLM
 from modern_llm.models.verifier import VerifierConfig, VerifierModel
+from modern_llm.training.distributed import init_distributed, is_main_process, main_process_first
 from modern_llm.training.train_dpo import DPOConfig, run_dpo
 from modern_llm.training.train_sft import run_sft
 from modern_llm.training.train_verifier import VerifierDatasetConfig, run_verifier_training
@@ -114,6 +116,17 @@ class AlignmentPipeline:
         if self.state_path.exists():
             self.logger.info(f"Loading pipeline state from {self.state_path}")
             self.state = PipelineState.load(self.state_path)
+
+    def _infer_sft_examples_per_dataset(self, dataset_count: int) -> int:
+        """Infer a practical per-source cap for SFT mixtures."""
+        if dataset_count <= 0:
+            raise ValueError("dataset_count must be positive")
+        if self.config.sft_num_examples_per_dataset is not None:
+            if self.config.sft_num_examples_per_dataset <= 0:
+                raise ValueError("sft_num_examples_per_dataset must be positive when set")
+            return self.config.sft_num_examples_per_dataset
+        examples_needed = max(1, self.config.sft_max_steps * self.config.sft_batch_size)
+        return max(1024, math.ceil(examples_needed / dataset_count))
 
     def run(
         self,
@@ -252,20 +265,27 @@ class AlignmentPipeline:
         if use_mixture:
             from modern_llm.data.sft_mixture import build_sft_mixture
 
+            init_distributed()
             tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_name)
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
-            self.logger.info(
-                f"Building SFT mixture over {len(self.config.sft_datasets)} "
-                f"datasets (weights={'uniform' if self.config.sft_dataset_weights is None else self.config.sft_dataset_weights})"
-            )
-            pre_built_dataset = build_sft_mixture(
-                dataset_names=self.config.sft_datasets,
-                weights=self.config.sft_dataset_weights,
-                tokenizer=tokenizer,
-                max_length=self.config.max_seq_len,
-                seed=self.config.seed,
-            )
+            examples_per_dataset = self._infer_sft_examples_per_dataset(len(self.config.sft_datasets))
+            with main_process_first():
+                if is_main_process():
+                    self.logger.info(
+                        f"Building SFT mixture over {len(self.config.sft_datasets)} "
+                        f"datasets (weights={'uniform' if self.config.sft_dataset_weights is None else self.config.sft_dataset_weights}, "
+                        f"cap_per_dataset={examples_per_dataset})"
+                    )
+                pre_built_dataset = build_sft_mixture(
+                    dataset_names=self.config.sft_datasets,
+                    weights=self.config.sft_dataset_weights,
+                    tokenizer=tokenizer,
+                    max_length=self.config.max_seq_len,
+                    seed=self.config.seed,
+                    num_examples_per_dataset=examples_per_dataset,
+                    log_fn=self.logger.info if is_main_process() else None,
+                )
 
         return run_sft(
             pretrain_checkpoint=self.state.pretrain_checkpoint,
@@ -295,6 +315,7 @@ class AlignmentPipeline:
             dpo_config=dpo_config,
             preference_config=preference_config,
             tokenizer_name=self.config.tokenizer_name,
+            num_examples=self.config.dpo_num_examples,
         )
 
     def _run_verifier(self) -> Path:

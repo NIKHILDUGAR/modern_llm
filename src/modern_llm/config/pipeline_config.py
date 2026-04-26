@@ -14,6 +14,8 @@ from typing import Any, List, Optional
 from .hardware_config import DataConfig, HardwareConfig, get_data_preset, get_hardware_preset
 from .model_config import ModernLLMConfig, MoEConfig
 from .train_config import TrainingConfig
+from modern_llm.quantization import QuantizationConfig
+from modern_llm.training.distributed import scale_grad_accum_for_world_size
 
 
 @dataclass
@@ -43,6 +45,10 @@ class PipelineConfig:
     scale_embeddings: bool = False
     residual_init_scale: bool = True
     z_loss_coef: float = 0.0
+    sequence_mixer: str = "attention"
+    gated_deltanet_layers: Optional[List[int]] = None
+    gated_deltanet_num_heads: Optional[int] = None
+    gated_deltanet_conv_kernel: int = 4
     compile_model: Optional[bool] = None
 
     # Hardware
@@ -81,6 +87,9 @@ class PipelineConfig:
     # Interleave probabilities for `sft_datasets` (must match its length, normalized to sum to 1.0).
     # When None, all listed datasets get equal weight.
     sft_dataset_weights: Optional[List[float]] = None
+    # Optional cap for each SFT source when building a multi-dataset mixture.
+    # When None, the pipeline infers a cap from sft_max_steps * sft_batch_size.
+    sft_num_examples_per_dataset: Optional[int] = None
 
     # DPO
     dpo_max_steps: int = 2000
@@ -89,6 +98,7 @@ class PipelineConfig:
     dpo_micro_batch_size: int = 1
     dpo_beta: float = 0.1
     dpo_dataset: str = "Anthropic/hh-rlhf"
+    dpo_num_examples: Optional[int] = None
 
     # Verifier
     verifier_max_steps: int = 3000
@@ -112,6 +122,11 @@ class PipelineConfig:
     eval_every: int = 500
     save_every: int = 2000
     log_every: int = 1000
+    quantization: Optional[QuantizationConfig] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.quantization, dict):
+            self.quantization = QuantizationConfig.from_dict(self.quantization)
 
     def get_model_config(self) -> ModernLLMConfig:
         """Build ModernLLMConfig from pipeline settings."""
@@ -147,10 +162,16 @@ class PipelineConfig:
             scale_embeddings=self.scale_embeddings,
             residual_init_scale=self.residual_init_scale,
             z_loss_coef=self.z_loss_coef,
+            sequence_mixer=self.sequence_mixer,
+            gated_deltanet_layers=self.gated_deltanet_layers,
+            gated_deltanet_num_heads=self.gated_deltanet_num_heads,
+            gated_deltanet_conv_kernel=self.gated_deltanet_conv_kernel,
         )
 
     def _resolve_compile_model(self) -> bool:
         """Default ON for Ada/Hopper+ (cap >= 8.9); OFF for Ampere/older. Overridable."""
+        if self.quantization is not None and self.quantization.enabled:
+            return False
         if self.compile_model is not None:
             return self.compile_model
         try:
@@ -170,6 +191,11 @@ class PipelineConfig:
         """Get data config from preset."""
         return get_data_preset(self.data_preset)
 
+    @staticmethod
+    def _global_grad_accum_steps(batch_size: int, micro_batch_size: int) -> int:
+        """Interpret batch_size as desired global batch across all ranks."""
+        return scale_grad_accum_for_world_size(batch_size, micro_batch_size)
+
     def get_pretrain_config(self) -> TrainingConfig:
         """Build TrainingConfig for pretraining stage."""
         return TrainingConfig(
@@ -179,7 +205,10 @@ class PipelineConfig:
             output_dir=Path(self.output_dir) / f"{self.run_name}-pretrain",
             batch_size=self.pretrain_batch_size,
             micro_batch_size=self.pretrain_micro_batch_size,
-            gradient_accumulation_steps=self.pretrain_batch_size // self.pretrain_micro_batch_size,
+            gradient_accumulation_steps=self._global_grad_accum_steps(
+                self.pretrain_batch_size,
+                self.pretrain_micro_batch_size,
+            ),
             learning_rate=self.pretrain_lr,
             max_steps=self.pretrain_max_steps,
             warmup_steps=self.pretrain_warmup_steps,
@@ -191,6 +220,7 @@ class PipelineConfig:
             seed=self.seed,
             mixed_precision=self.mixed_precision,  # type: ignore
             compile_model=self._resolve_compile_model(),
+            quantization=self.quantization,
         )
 
     def get_sft_config(self) -> TrainingConfig:
@@ -202,7 +232,10 @@ class PipelineConfig:
             output_dir=Path(self.output_dir) / f"{self.run_name}-sft",
             batch_size=self.sft_batch_size,
             micro_batch_size=self.sft_micro_batch_size,
-            gradient_accumulation_steps=self.sft_batch_size // self.sft_micro_batch_size,
+            gradient_accumulation_steps=self._global_grad_accum_steps(
+                self.sft_batch_size,
+                self.sft_micro_batch_size,
+            ),
             learning_rate=self.sft_lr,
             max_steps=self.sft_max_steps,
             warmup_steps=100,
@@ -213,6 +246,7 @@ class PipelineConfig:
             seed=self.seed,
             mixed_precision=self.mixed_precision,  # type: ignore
             compile_model=self._resolve_compile_model(),
+            quantization=self.quantization,
         )
 
     def get_dpo_config(self) -> TrainingConfig:
@@ -224,7 +258,10 @@ class PipelineConfig:
             output_dir=Path(self.output_dir) / f"{self.run_name}-dpo",
             batch_size=self.dpo_batch_size,
             micro_batch_size=self.dpo_micro_batch_size,
-            gradient_accumulation_steps=self.dpo_batch_size // self.dpo_micro_batch_size,
+            gradient_accumulation_steps=self._global_grad_accum_steps(
+                self.dpo_batch_size,
+                self.dpo_micro_batch_size,
+            ),
             learning_rate=self.dpo_lr,
             max_steps=self.dpo_max_steps,
             warmup_steps=50,
@@ -235,6 +272,7 @@ class PipelineConfig:
             seed=self.seed,
             mixed_precision=self.mixed_precision,  # type: ignore
             compile_model=self._resolve_compile_model(),
+            quantization=self.quantization,
         )
 
     def get_verifier_config(self) -> TrainingConfig:
@@ -246,7 +284,10 @@ class PipelineConfig:
             output_dir=Path(self.output_dir) / f"{self.run_name}-verifier",
             batch_size=self.verifier_batch_size,
             micro_batch_size=self.verifier_micro_batch_size,
-            gradient_accumulation_steps=self.verifier_batch_size // self.verifier_micro_batch_size,
+            gradient_accumulation_steps=self._global_grad_accum_steps(
+                self.verifier_batch_size,
+                self.verifier_micro_batch_size,
+            ),
             learning_rate=self.verifier_lr,
             max_steps=self.verifier_max_steps,
             warmup_steps=100,
@@ -257,6 +298,7 @@ class PipelineConfig:
             seed=self.seed,
             mixed_precision=self.mixed_precision,  # type: ignore
             compile_model=self._resolve_compile_model(),
+            quantization=self.quantization,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -371,6 +413,3 @@ def get_pipeline_preset(name: str) -> PipelineConfig:
     if name not in presets:
         raise ValueError(f"Unknown pipeline preset: {name}. Choose from {list(presets.keys())}")
     return presets[name]()
-
-
-

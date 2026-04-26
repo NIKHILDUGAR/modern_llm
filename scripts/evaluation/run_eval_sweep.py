@@ -56,12 +56,13 @@ def is_already_evaluated(summary_path: Path) -> bool:
         data = json.loads(summary_path.read_text())
     except Exception:
         return False
-    #tasks = data.get("tasks") or []
-    #by_name = {t.get("task"): t for t in tasks if isinstance(t, dict)}
-    #for name in EXPECTED_TASK_NAMES:
-    #    entry = by_name.get(name)
-    #    if not entry or entry.get("status") != "ok" or entry.get("metric") is None:
-    #        return False
+    tasks = data.get("tasks") or []
+    by_name = {t.get("task"): t for t in tasks if isinstance(t, dict)}
+    expected = data.get("_expected_tasks") or EXPECTED_TASK_NAMES
+    for name in expected:
+        entry = by_name.get(name)
+        if not entry or entry.get("status") != "ok" or entry.get("metric") is None:
+            return False
     return True
 
 
@@ -129,6 +130,12 @@ def run_job(job: Job, gpu_id: int, args: argparse.Namespace) -> dict:
            "--device", "cuda"]  # GPU index is pinned via CUDA_VISIBLE_DEVICES
     if job.tokenizer:
         cmd += ["--tokenizer", job.tokenizer]
+    if args.fast:
+        cmd += ["--fast"]
+    if args.tasks:
+        cmd += ["--tasks", *args.tasks]
+    if args.skip:
+        cmd += ["--skip", *args.skip]
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -244,6 +251,12 @@ def main() -> int:
                         help="Skip gpt2 + SmolLM2-135M baselines.")
     parser.add_argument("--force", action="store_true",
                         help="Re-evaluate even if a complete summary.json already exists.")
+    parser.add_argument("--fast", action="store_true",
+                        help="Pass --fast through to eval_all.py.")
+    parser.add_argument("--tasks", nargs="+", default=None,
+                        help="Task subset to pass through to eval_all.py.")
+    parser.add_argument("--skip", nargs="+", default=[],
+                        help="Tasks to skip when calling eval_all.py.")
     args = parser.parse_args()
 
     jobs = build_jobs(args)
@@ -257,7 +270,6 @@ def main() -> int:
     skipped: List[Job] = []
     cou=0
     for j in jobs:
-        args.force=False
         summary_path = output_root / j.slug / "eval_all_summary.json"
         print(summary_path)
         if not args.force and is_already_evaluated(summary_path):

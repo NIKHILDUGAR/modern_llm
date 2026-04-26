@@ -23,7 +23,13 @@ from modern_llm.data.instruction_datasets import (
     load_instruction_dataset,
 )
 from modern_llm.models.transformer import ModernDecoderLM
-from modern_llm.training.distributed import get_device, init_distributed, is_main_process
+from modern_llm.quantization import prepare_model_for_quantization
+from modern_llm.training.distributed import (
+    get_device,
+    init_distributed,
+    is_main_process,
+    scale_grad_accum_for_world_size,
+)
 from modern_llm.training.trainer_base import Trainer
 from modern_llm.utils.checkpointing import load_checkpoint
 from modern_llm.utils.paths import apply_env_defaults
@@ -83,6 +89,14 @@ def run_sft(
     if is_main_process():
         print(f"Loading pretrained model from {pretrain_checkpoint}")
     model, model_config = load_pretrained_model(pretrain_checkpoint, device)
+    if train_config.quantization is not None and train_config.quantization.enabled:
+        train_config.compile_model = False
+        summary = prepare_model_for_quantization(model, train_config.quantization)
+        if is_main_process():
+            print(
+                f"Quantization enabled: mode={summary.mode} "
+                f"replaced_modules={len(summary.replaced_modules)}"
+            )
     if is_main_process():
         print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
 
@@ -97,7 +111,13 @@ def run_sft(
         train_dataset = load_instruction_dataset(dataset_config, tokenizer)
     else:
         print(f"Using pre-built train_dataset ({type(train_dataset).__name__})")
-    print(f"Training examples: {len(train_dataset)}")
+    train_examples = len(train_dataset)
+    print(f"Training examples: {train_examples}")
+    if train_examples == 0:
+        raise ValueError(
+            f"SFT training dataset is empty after loading {dataset_config.dataset_name}. "
+            "Use a schema-specific loader such as build_sft_mixture for chat-format datasets."
+        )
 
     train_dataloader = create_instruction_dataloader(
         train_dataset,
@@ -242,7 +262,10 @@ def main() -> None:
             output_dir=args.output_dir / args.run_name,
             batch_size=args.batch_size,
             micro_batch_size=args.micro_batch_size,
-            gradient_accumulation_steps=args.batch_size // args.micro_batch_size,
+            gradient_accumulation_steps=scale_grad_accum_for_world_size(
+                args.batch_size,
+                args.micro_batch_size,
+            ),
             learning_rate=args.lr,
             max_steps=args.max_steps,
             warmup_steps=100,

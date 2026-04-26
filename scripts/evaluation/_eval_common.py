@@ -46,7 +46,10 @@ _VALID_CONFIG_KEYS = {
     "max_seq_len", "rmsnorm_eps", "dropout", "initializer_range",
     "rope_theta", "rope_scaling", "use_rope", "use_attention_sinks",
     "num_attention_sinks", "use_swiglu", "swiglu_multiplier", "use_gqa",
-    "gqa_groups", "use_moe", "moe_config", "tie_embeddings",
+    "gqa_groups", "use_qk_norm", "use_moe", "moe_config", "tie_embeddings",
+    "scale_embeddings", "residual_init_scale", "z_loss_coef",
+    "sequence_mixer", "gated_deltanet_layers", "gated_deltanet_num_heads",
+    "gated_deltanet_conv_kernel",
 }
 
 

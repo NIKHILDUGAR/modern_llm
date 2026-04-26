@@ -45,6 +45,13 @@ from modern_llm.data.instruction_datasets import (
 from modern_llm.utils.paths import cache_dir_for_datasets
 
 
+# Runtime loader config registry. Keep this aligned with
+# scripts/data/download_sft_mix.py and scripts/data/tokenize_sft.py.
+_DATASET_CONFIG_REGISTRY: dict[str, str] = {
+    "HuggingFaceTB/smoltalk": "all",
+}
+
+
 # --------------------------------------------------------------------- #
 # Per-dataset schema adapters: raw HF row -> (instruction, input, output)
 # Returns None if the row is unusable (empty, missing fields) and should
@@ -327,12 +334,29 @@ def _normalize_weights(
     return [w / total for w in weights]
 
 
+def _resolve_dataset_load_args(dataset_name: str) -> tuple[str, Optional[str]]:
+    """Resolve a configured SFT dataset into HF path + optional config name."""
+
+    if "::" in dataset_name:
+        name, config = dataset_name.split("::", 1)
+        return name, config or None
+
+    if ":" in dataset_name:
+        name, config = dataset_name.rsplit(":", 1)
+        if name and config:
+            return name, config
+
+    return dataset_name, _DATASET_CONFIG_REGISTRY.get(dataset_name)
+
+
 def _load_raw(dataset_name: str, split: str = "train"):
     """Import-gated HF dataset load; kept as a seam for testing."""
     from datasets import load_dataset
 
+    hf_name, hf_config = _resolve_dataset_load_args(dataset_name)
     return load_dataset(
-        dataset_name,
+        hf_name,
+        hf_config,
         split=split,
         cache_dir=cache_dir_for_datasets(),
     )
@@ -346,6 +370,7 @@ def build_sft_mixture(
     seed: int = 42,
     split: str = "train",
     num_examples_per_dataset: Optional[int] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
     _loader: Optional[Callable[[str, str], object]] = None,
 ) -> SFTMixtureDataset:
     """Load + normalize + interleave multiple SFT datasets.
@@ -377,9 +402,16 @@ def build_sft_mixture(
     raw_datasets = []
     adapters: list[Callable[[dict], Optional[dict]]] = []
     for name in dataset_names:
-        ds = loader(name, split)
+        load_split = split
+        if num_examples_per_dataset is not None and _loader is None:
+            load_split = f"{split}[:{num_examples_per_dataset}]"
+        if log_fn is not None:
+            log_fn(f"Loading SFT source {name} ({load_split})")
+        ds = loader(name, load_split)
         if num_examples_per_dataset is not None:
             ds = ds.select(range(min(num_examples_per_dataset, len(ds))))
+        if log_fn is not None:
+            log_fn(f"Loaded SFT source {name}: {len(ds)} examples")
         # Tag rows with their source index so we can pick the right adapter
         # after interleave (which loses per-row provenance otherwise).
         raw_datasets.append(ds)
@@ -400,12 +432,17 @@ def build_sft_mixture(
     # Materialize — these are SFT-scale datasets; we want a fixed-length
     # torch Dataset for Trainer. Streaming would only matter if the
     # mixture exceeded RAM which is not the case for the target configs.
+    if log_fn is not None:
+        log_fn("Materializing capped SFT mixture")
     rows = [dict(r) for r in interleaved]
     source_ids = [r.pop("_source_id") for r in rows]
-    return SFTMixtureDataset(
+    dataset = SFTMixtureDataset(
         rows=rows,
         adapters=adapters,
         source_ids=source_ids,
         tokenizer=tokenizer,
         max_length=max_length,
     )
+    if log_fn is not None:
+        log_fn(f"Built SFT mixture: {len(dataset)} usable examples")
+    return dataset

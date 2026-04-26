@@ -1,6 +1,6 @@
 {
-  "run_name": "lm-75m-2x4090",
-  "output_dir": "experiments/runs/lm-75m-2x4090",
+  "run_name": "lm-75m-2x4090-bitnet",
+  "output_dir": "experiments/runs/lm-75m-2x4090-bitnet",
   "vocab_size": 16000,
   "d_model": 512,
   "n_layers": 20,
@@ -21,7 +21,7 @@
   "scale_embeddings": true,
   "residual_init_scale": true,
   "z_loss_coef": 1e-4,
-  "compile_model": true,
+  "compile_model": false,
   "hardware_preset": "auto",
   "data_preset": "xl",
   "tokenizer_name": "tokenizers/cl_small_bpe_16k",
@@ -41,6 +41,7 @@
   "pretrain_warmup_steps": 4000,
   "pretrain_min_lr_ratio": 0.1,
   "pretrain_eval_windows": 4096,
+
   "sft_max_steps": 20000,
   "sft_lr": 5e-5,
   "sft_batch_size": 32,
@@ -73,5 +74,16 @@
   "mixed_precision": "bf16",
   "eval_every": 5000,
   "save_every": 10000,
-  "log_every": 100
+  "log_every": 100,
+  "quantization": {
+    "mode": "bitnet_b1_58",
+    "target_modules": ["attention", "ffn"],
+    "scale_method": "median",
+    "quant_start_step": 2000,
+    "skip_first_blocks": 2,
+    "skip_last_blocks": 2,
+    "quantize_lm_head": false,
+    "quantize_embeddings": false,
+    "export_quantized_checkpoint": true
+  }
 }

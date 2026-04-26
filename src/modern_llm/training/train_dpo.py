@@ -26,12 +26,20 @@ from modern_llm.alignment.dpo_loss import dpo_loss
 from modern_llm.config import ModernLLMConfig, PipelineConfig, TrainingConfig
 from modern_llm.data.preference_datasets import PreferenceDatasetConfig, load_preference_dataset
 from modern_llm.models.transformer import ModernDecoderLM
+from modern_llm.quantization import (
+    get_quantization_payload,
+    prepare_model_for_quantization,
+    set_quantization_step,
+)
 from modern_llm.training.distributed import (
     barrier,
     get_device,
     init_distributed,
+    is_distributed,
     is_main_process,
+    main_process_first,
     maybe_distributed_sampler,
+    scale_grad_accum_for_world_size,
     seed_everything,
     unwrap_model,
     wrap_ddp,
@@ -78,25 +86,59 @@ class PreferenceDataset(Dataset):
             if processed:
                 self.examples.append(processed)
 
+    @staticmethod
+    def _chat_messages_to_text(messages: list, response_only: bool) -> str:
+        """Convert chat messages to text for DPO chosen/rejected fields."""
+        if response_only:
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    return str(msg.get("content", "")).strip()
+
+        parts = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                parts.append(str(msg))
+                continue
+            role = str(msg.get("role", "user")).capitalize()
+            content = str(msg.get("content", "")).strip()
+            if content:
+                parts.append(f"{role}: {content}")
+        return "\n".join(parts).strip()
+
+    @classmethod
+    def _coerce_text(cls, value, response_only: bool = False) -> str:
+        """Normalize preference fields that may be strings or chat-message lists."""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return cls._chat_messages_to_text(value, response_only=response_only)
+        if value is None:
+            return ""
+        return str(value).strip()
+
     def _process_item(self, item: dict, config: PreferenceDatasetConfig) -> Optional[dict]:
         """Tokenize a single preference pair."""
         # Try to get prompt from config field, or fall back to "prompt" key if it exists
         if config.prompt_field and config.prompt_field in item:
-            prompt = item[config.prompt_field]
+            prompt = self._coerce_text(item[config.prompt_field])
         elif "prompt" in item:
-            prompt = item["prompt"]
+            prompt = self._coerce_text(item["prompt"])
         else:
             prompt = ""
         
         # Get chosen/rejected (may be processed from original dataset format)
-        chosen = item.get("chosen", item.get(config.chosen_field, ""))
-        rejected = item.get("rejected", item.get(config.rejected_field, ""))
+        response_only = bool(prompt)
+        chosen = self._coerce_text(
+            item.get("chosen", item.get(config.chosen_field, "")),
+            response_only=response_only,
+        )
+        rejected = self._coerce_text(
+            item.get("rejected", item.get(config.rejected_field, "")),
+            response_only=response_only,
+        )
 
-        # Handle nested format (some datasets have {"content": ...})
-        if isinstance(chosen, list):
-            chosen = " ".join(c.get("content", str(c)) for c in chosen)
-        if isinstance(rejected, list):
-            rejected = " ".join(r.get("content", str(r)) for r in rejected)
+        if not chosen or not rejected:
+            return None
 
         # Combine prompt with responses
         chosen_text = f"{prompt}\n{chosen}" if prompt else chosen
@@ -213,6 +255,9 @@ class DPOTrainer:
 
         self.global_step = 0
         self.micro_step = 0
+        self._metric_loss_sum = 0.0
+        self._metric_correct = 0.0
+        self._metric_count = 0.0
 
     def train(self) -> None:
         """Run DPO training loop."""
@@ -236,31 +281,34 @@ class DPOTrainer:
                     sampler.set_epoch(epoch)
 
                 for batch in self.train_dataloader:
-                    prev_step = self.global_step
-                    loss, metrics = self._training_step(batch, accumulation_steps)
+                    loss, metrics, step_completed = self._training_step(batch, accumulation_steps)
 
-                    if self.global_step > prev_step:
-                        pbar.update(self.global_step - prev_step)
+                    if step_completed:
+                        pbar.update(1)
                         pbar.set_postfix(loss=f"{loss:.4f}", acc=f"{metrics['accuracy']:.2%}")
+
+                        if (
+                            self.config.log_every > 0
+                            and self.global_step % self.config.log_every == 0
+                            and is_main_process()
+                        ):
+                            self.logger.info(
+                                "step=%d loss=%.4f accuracy=%.2f%% lr=%.3e",
+                                self.global_step,
+                                loss,
+                                metrics["accuracy"] * 100,
+                                self.optimizer.param_groups[0]["lr"],
+                            )
+
+                        if (
+                            self.config.save_every > 0
+                            and self.global_step > 0
+                            and self.global_step % self.config.save_every == 0
+                        ):
+                            self._save_checkpoint()
 
                     if self.global_step >= max_steps:
                         break
-
-                    if (
-                        self.config.log_every > 0
-                        and self.global_step % self.config.log_every == 0
-                        and is_main_process()
-                    ):
-                        self.logger.info(
-                            "step=%d loss=%.4f accuracy=%.2f%% lr=%.3e",
-                            self.global_step,
-                            loss,
-                            metrics["accuracy"] * 100,
-                            self.optimizer.param_groups[0]["lr"],
-                        )
-
-                    if self.config.save_every > 0 and self.global_step % self.config.save_every == 0:
-                        self._save_checkpoint()
 
                 if self.global_step >= max_steps:
                     break
@@ -268,20 +316,18 @@ class DPOTrainer:
 
         self._save_checkpoint(suffix="final")
 
-    def _training_step(self, batch: dict, accumulation_steps: int) -> tuple[float, dict]:
+    def _training_step(self, batch: dict, accumulation_steps: int) -> tuple[float, dict, bool]:
         """Execute one DPO training step."""
+        if self.config.quantization is not None and self.config.quantization.enabled:
+            set_quantization_step(unwrap_model(self.model), self.global_step)
         batch = self._move_to_device(batch)
 
         autocast_dtype = torch.bfloat16 if self.config.mixed_precision == "bf16" else torch.float16
         with autocast(device_type="cuda", dtype=autocast_dtype, enabled=self.use_amp):
-            # Forward pass for chosen and rejected
+            # The rejected branch is only needed as the comparison baseline;
+            # the chosen branch is recomputed below with gradients.
             self.model.eval()  # No dropout for log prob computation
             with torch.no_grad():
-                chosen_logprobs = compute_sequence_logprobs(
-                    self.model,
-                    batch["chosen_input_ids"],
-                    batch["chosen_attention_mask"],
-                )
                 rejected_logprobs = compute_sequence_logprobs(
                     self.model,
                     batch["rejected_input_ids"],
@@ -310,12 +356,12 @@ class DPOTrainer:
             chosen_logprobs_grad = token_log_probs.sum(dim=-1)
 
             # DPO loss
-            loss = dpo_loss(
+            raw_loss = dpo_loss(
                 chosen_logprobs_grad,
                 rejected_logprobs.detach(),
                 beta=self.dpo_config.beta,
             )
-            loss = loss / accumulation_steps
+            loss = raw_loss / accumulation_steps
 
         # Backward
         if self.scaler is not None:
@@ -323,8 +369,24 @@ class DPOTrainer:
         else:
             loss.backward()
 
+        with torch.no_grad():
+            batch_count = float(chosen_logprobs_grad.numel())
+            batch_correct = float(
+                (chosen_logprobs_grad.detach() > rejected_logprobs.detach())
+                .float()
+                .sum()
+                .item()
+            )
+            self._metric_loss_sum += float(raw_loss.detach().float().cpu().item()) * batch_count
+            self._metric_correct += batch_correct
+            self._metric_count += batch_count
+
         self.micro_step += 1
         step_completed = self.micro_step % accumulation_steps == 0
+        reported_loss = float(raw_loss.detach().float().cpu().item())
+        reported_metrics = {
+            "accuracy": batch_correct / batch_count if batch_count > 0 else 0.0,
+        }
 
         if step_completed:
             if self.scaler is not None:
@@ -341,11 +403,23 @@ class DPOTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
 
-        # Metrics
-        with torch.no_grad():
-            accuracy = (chosen_logprobs > rejected_logprobs).float().mean().item()
+            metric_totals = torch.tensor(
+                [self._metric_loss_sum, self._metric_correct, self._metric_count],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if is_distributed():
+                torch.distributed.all_reduce(metric_totals, op=torch.distributed.ReduceOp.SUM)
+            total_loss, total_correct, total_count = metric_totals.tolist()
+            if total_count > 0:
+                reported_loss = total_loss / total_count
+                reported_metrics = {"accuracy": total_correct / total_count}
 
-        return float(loss.item() * accumulation_steps), {"accuracy": accuracy}
+            self._metric_loss_sum = 0.0
+            self._metric_correct = 0.0
+            self._metric_count = 0.0
+
+        return reported_loss, reported_metrics, step_completed
 
     def _move_to_device(self, batch: dict) -> dict:
         return {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()}
@@ -365,14 +439,20 @@ class DPOTrainer:
         config_dict = None
         if hasattr(bare_model, "config"):
             config_dict = {k: v for k, v in bare_model.config.__dict__.items() if not k.startswith("_")}
+        checkpoint_metadata = {
+            "step": self.global_step,
+            "run_name": self.config.run_name,
+            "config": config_dict,
+        }
+        quantization_payload = get_quantization_payload(bare_model)
+        if quantization_payload is not None:
+            checkpoint_metadata["quantization"] = quantization_payload
 
         save_checkpoint(
             path,
             model_state=bare_model.state_dict(),
             optimizer_state=self.optimizer.state_dict(),
-            step=self.global_step,
-            run_name=self.config.run_name,
-            config=config_dict,
+            **checkpoint_metadata,
         )
         self.logger.info(f"Saved checkpoint: {path}")
         barrier()
@@ -402,6 +482,7 @@ def run_dpo(
     dpo_config: DPOConfig,
     preference_config: PreferenceDatasetConfig,
     tokenizer_name: str = "Xenova/text-embedding-ada-002",
+    num_examples: Optional[int] = None,
 ) -> Path:
     """Run DPO training on an SFT model.
 
@@ -414,6 +495,13 @@ def run_dpo(
     if is_main_process():
         print(f"Loading SFT model from {sft_checkpoint}")
     model, model_config = load_model_from_checkpoint(sft_checkpoint, device)
+    if train_config.quantization is not None and train_config.quantization.enabled:
+        summary = prepare_model_for_quantization(model, train_config.quantization)
+        if is_main_process():
+            print(
+                f"Quantization enabled: mode={summary.mode} "
+                f"replaced_modules={len(summary.replaced_modules)}"
+            )
     if is_main_process():
         print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
 
@@ -421,13 +509,17 @@ def run_dpo(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading preference dataset: {preference_config.dataset_name}")
-    dataset = PreferenceDataset(
-        preference_config,
-        tokenizer,
-        max_length=dpo_config.max_length,
-    )
-    print(f"Preference pairs: {len(dataset)}")
+    if is_main_process():
+        print(f"Loading preference dataset: {preference_config.dataset_name}")
+    with main_process_first():
+        dataset = PreferenceDataset(
+            preference_config,
+            tokenizer,
+            max_length=dpo_config.max_length,
+            num_examples=num_examples,
+        )
+    if is_main_process():
+        print(f"Preference pairs: {len(dataset)}")
 
     sampler = maybe_distributed_sampler(dataset, shuffle=True, seed=train_config.seed or 42)
     dataloader = DataLoader(
@@ -457,11 +549,13 @@ def run_dpo(
         lr_scheduler=scheduler,
     )
 
-    print(f"Starting DPO for {train_config.max_steps} steps (beta={dpo_config.beta})")
+    if is_main_process():
+        print(f"Starting DPO for {train_config.max_steps} steps (beta={dpo_config.beta})")
     trainer.train()
 
     final_ckpt = train_config.output_dir / f"{train_config.run_name}_final.pt"
-    print(f"DPO complete. Final checkpoint: {final_ckpt}")
+    if is_main_process():
+        print(f"DPO complete. Final checkpoint: {final_ckpt}")
     return final_ckpt
 
 
@@ -557,7 +651,10 @@ def main() -> None:
             output_dir=args.output_dir / args.run_name,
             batch_size=args.batch_size,
             micro_batch_size=args.micro_batch_size,
-            gradient_accumulation_steps=args.batch_size // args.micro_batch_size,
+            gradient_accumulation_steps=scale_grad_accum_for_world_size(
+                args.batch_size,
+                args.micro_batch_size,
+            ),
             learning_rate=args.lr,
             max_steps=args.max_steps,
             warmup_steps=50,
