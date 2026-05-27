@@ -4,6 +4,7 @@ from .layers import RMSNorm, SwiGLU
 from .loading import build_model_from_checkpoint_payload, load_model_from_checkpoint
 from .attention import MultiHeadAttention
 from .gated_deltanet import GatedDeltaNet, GatedDeltaNetConfig
+from .lfm2 import LFM2MLP, LFM2ShortConv
 from .transformer import ModernDecoderLM
 from .moe import TopKRouter, MixtureOfExperts
 from .verifier import VerifierConfig, VerifierModel
@@ -16,6 +17,8 @@ __all__ = [
     "MultiHeadAttention",
     "GatedDeltaNet",
     "GatedDeltaNetConfig",
+    "LFM2MLP",
+    "LFM2ShortConv",
     "ModernDecoderLM",
     "TopKRouter",
     "MixtureOfExperts",

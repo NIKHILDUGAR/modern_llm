@@ -138,6 +138,7 @@ def wrap_ddp(
     static_graph: bool = True,
     gradient_as_bucket_view: bool = True,
     bf16_comm_hook: bool = True,
+    find_unused_parameters: bool = False,
 ) -> torch.nn.Module:
     """Wrap a model in DistributedDataParallel.
 
@@ -151,6 +152,8 @@ def wrap_ddp(
         - static_graph=True: enables additional comm/compute overlap by
           assuming the autograd graph is unchanged across iterations
           (true for our pure causal LM forward).
+        - find_unused_parameters=False: enabled only by callers that use
+          dynamic subgraphs such as MatFormer FFN sampling.
         - bf16 comm hook: bandwidth-halving allreduce on PCIe boxes,
           ~20–30% throughput lift on 2x4090.
     """
@@ -165,6 +168,7 @@ def wrap_ddp(
         output_device=local_rank() if torch.cuda.is_available() else None,
         gradient_as_bucket_view=gradient_as_bucket_view,
         static_graph=static_graph,
+        find_unused_parameters=find_unused_parameters,
     )
 
     if bf16_comm_hook and torch.cuda.is_available():

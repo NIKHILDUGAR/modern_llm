@@ -34,6 +34,8 @@ class PipelineConfig:
     max_seq_len: int = 1024
     dropout: float = 0.1
     use_rope: bool = True
+    rope_theta: float = 10000.0
+    rope_pairing: str = "half_split"
     use_attention_sinks: bool = True
     num_attention_sinks: int = 4
     use_swiglu: bool = True
@@ -49,6 +51,14 @@ class PipelineConfig:
     gated_deltanet_layers: Optional[List[int]] = None
     gated_deltanet_num_heads: Optional[int] = None
     gated_deltanet_conv_kernel: int = 4
+    lfm2_attention_layers: Optional[List[int]] = None
+    lfm2_conv_kernel: int = 3
+    lfm2_conv_bias: bool = False
+    use_matformer: bool = False
+    matformer_granularities: Optional[List[int]] = None
+    matformer_train_sample: bool = False
+    matformer_sampling_probs: Optional[List[float]] = None
+    matformer_active_granularity: Optional[int] = None
     compile_model: Optional[bool] = None
 
     # Hardware
@@ -127,20 +137,15 @@ class PipelineConfig:
     def __post_init__(self) -> None:
         if isinstance(self.quantization, dict):
             self.quantization = QuantizationConfig.from_dict(self.quantization)
+        if self.use_matformer and self.quantization is not None and self.quantization.enabled:
+            raise ValueError("MatFormer is not compatible with quantization in this patch")
 
     def get_model_config(self) -> ModernLLMConfig:
         """Build ModernLLMConfig from pipeline settings."""
         moe_config = None
-        import json
-        with open(self.output_dir+'config.txt', 'w') as fp:
-            for key, value in self.__dict__.items():    
-                fp.write(f"{key}: {value}")
-                print(f"{key}: {value}")
-
         if self.use_moe:
             moe_config = MoEConfig()
 
-        print("get_hardware_preset(self.hardware_preset",get_hardware_preset(self.hardware_preset))
         return ModernLLMConfig(
             vocab_size=self.vocab_size,
             d_model=self.d_model,
@@ -150,6 +155,8 @@ class PipelineConfig:
             max_seq_len=self.max_seq_len,
             dropout=self.dropout,
             use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
+            rope_pairing=self.rope_pairing,
             use_attention_sinks=self.use_attention_sinks,
             num_attention_sinks=self.num_attention_sinks,
             use_swiglu=self.use_swiglu,
@@ -166,6 +173,14 @@ class PipelineConfig:
             gated_deltanet_layers=self.gated_deltanet_layers,
             gated_deltanet_num_heads=self.gated_deltanet_num_heads,
             gated_deltanet_conv_kernel=self.gated_deltanet_conv_kernel,
+            lfm2_attention_layers=self.lfm2_attention_layers,
+            lfm2_conv_kernel=self.lfm2_conv_kernel,
+            lfm2_conv_bias=self.lfm2_conv_bias,
+            use_matformer=self.use_matformer,
+            matformer_granularities=self.matformer_granularities,
+            matformer_train_sample=self.matformer_train_sample,
+            matformer_sampling_probs=self.matformer_sampling_probs,
+            matformer_active_granularity=self.matformer_active_granularity,
         )
 
     def _resolve_compile_model(self) -> bool:

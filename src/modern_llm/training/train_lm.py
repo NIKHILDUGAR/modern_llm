@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -264,11 +265,29 @@ def run_training(
     total = max(train_config.max_steps, warm + 1)
     min_ratio = train_config.min_lr_ratio
 
+    # Optional env override that specifies a step where the LR should reach
+    # the cosine minimum (plateau). When set, scale the cosine "progress"
+    # so the scheduler reaches the minimum at that step instead of at `total`.
+    plateau_env = 0
+    try:
+        plateau_env = int(os.environ.get("PRETRAIN_LR_PLATEAU_STEP", "0") or 0)
+    except Exception:
+        plateau_env = 0
+
+    if plateau_env and plateau_env > warm:
+        plateau = plateau_env
+        scale = max(1.0, (total - warm) / max(1, (plateau - warm)))
+        if is_main_process():
+            print(f"[train_lm] PRETRAIN_LR_PLATEAU_STEP={plateau} -> scaling lr progress by {scale:.6f}")
+    else:
+        # Preserve previous heuristic multiplier when no plateau override provided.
+        scale = 1.3
+
     def lr_lambda(step: int) -> float:
         if step < train_config.warmup_steps:
             return float(step + 1) / float(warm)
         progress = (step - warm) / max(total - warm, 1)
-        progress = min(max(progress, 0.0), 1.0)
+        progress = min(max(progress * scale, 0.0), 1.0)
         return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)

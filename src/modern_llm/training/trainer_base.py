@@ -9,9 +9,11 @@ they remain interchangeable between single-GPU and multi-GPU runs.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import torch
@@ -54,6 +56,7 @@ class Trainer:
 
     device: torch.device = field(init=False)
     logger: logging.Logger = field(init=False)
+    metrics_path: Optional[Path] = field(init=False, default=None)
     use_amp: bool = field(init=False)
     scaler: Optional[GradScaler] = field(init=False, default=None)
     global_step: int = field(init=False, default=0)
@@ -70,9 +73,20 @@ class Trainer:
         # AllReduce hooks rather than graph-breaking at them.
         self.device = get_device()
         self.logger = create_logger(f"trainer.{self.config.run_name}")
+        if is_main_process():
+            self.metrics_path = self.config.output_dir / f"{self.config.run_name}_metrics.jsonl"
         self.model.to(self.device)
         # NOTE: wrap_ddp returns the bare model when WORLD_SIZE<=1.
-        self.model = wrap_ddp(self.model)
+        model_config = getattr(self.model, "config", None)
+        matformer_sampling = bool(
+            getattr(model_config, "use_matformer", False)
+            and getattr(model_config, "matformer_train_sample", False)
+        )
+        self.model = wrap_ddp(
+            self.model,
+            static_graph=not matformer_sampling,
+            find_unused_parameters=matformer_sampling,
+        )
         if self.config.compile_model and hasattr(torch, "compile"):
             # python_reducer avoids the C++ DDP reducer's _broadcast_coalesced
             # call that dynamo cannot trace, which otherwise graph-breaks the
@@ -124,6 +138,18 @@ class Trainer:
 
                     if step_completed:
                         pbar.update(1)
+                        train_perplexity = self._loss_to_perplexity(loss)
+
+                        if is_main_process():
+                            self._record_metrics(
+                                {
+                                    "phase": "train",
+                                    "step": self.global_step,
+                                    "loss": loss,
+                                    "perplexity": train_perplexity,
+                                    "lr": self.optimizer.param_groups[0]["lr"],
+                                }
+                            )
 
                         if (
                             self.config.log_every > 0
@@ -131,9 +157,10 @@ class Trainer:
                             and is_main_process()
                         ):
                             self.logger.info(
-                                "step=%d loss=%.4f lr=%.3e",
+                                "step=%d loss=%.4f ppl=%.2f lr=%.3e",
                                 self.global_step,
                                 loss,
+                                train_perplexity,
                                 self.optimizer.param_groups[0]["lr"],
                             )
                         if (
@@ -144,6 +171,15 @@ class Trainer:
                         ):
                             metrics = self.evaluate()
                             if is_main_process():
+                                self._record_metrics(
+                                    {
+                                        "phase": "eval",
+                                        "step": self.global_step,
+                                        "loss": metrics["loss"],
+                                        "perplexity": metrics["perplexity"],
+                                        "lr": self.optimizer.param_groups[0]["lr"],
+                                    }
+                                )
                                 self.logger.info(
                                     "eval step=%d loss=%.4f ppl=%.2f",
                                     self.global_step,
@@ -264,6 +300,16 @@ class Trainer:
         return {"loss": avg_loss, "perplexity": perplexity}
 
     # ----------------------------------------------------------------- utils
+
+    @staticmethod
+    def _loss_to_perplexity(loss: float) -> float:
+        return math.exp(loss) if math.isfinite(loss) and loss < 20 else float("inf")
+
+    def _record_metrics(self, metrics: Dict[str, float | int | str]) -> None:
+        if self.metrics_path is None:
+            return
+        with self.metrics_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(metrics, sort_keys=True) + "\n")
 
     def _move_batch_to_device(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
         return {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}

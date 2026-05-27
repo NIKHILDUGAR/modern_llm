@@ -1,6 +1,6 @@
 {
-  "run_name": "lm-75m-2x4090-smoke",
-  "output_dir": "experiments/runs/lm-75m-2x4090-smoke",
+  "run_name": "lm-75m-2x4090-smoketest",
+  "output_dir": "experiments/runs/lm-75m-2x4090-smoketest",
 
   "vocab_size": 16000,
   "d_model": 512,
@@ -23,40 +23,50 @@
   "scale_embeddings": true,
   "residual_init_scale": true,
   "z_loss_coef": 1e-4,
-  "compile_model": true,
+  "compile_model": false,
 
   "hardware_preset": "auto",
   "data_preset": "xl",
   "tokenizer_name": "tokenizers/cl_small_bpe_16k",
 
-  "pretrain_datasets": ["wikitext-2-raw-v1"],
-  "pretrain_max_steps": 50,
-  "pretrain_lr": 3e-3,
-  "pretrain_batch_size": 2,
-  "pretrain_micro_batch_size": 1,
+  "pretrain_datasets": [
+    "HuggingFaceFW/fineweb-edu",
+    "mlfoundations/dclm-baseline-1.0",
+    "open-web-math/open-web-math",
+    "wikimedia/wikipedia",
+    "togethercomputer/RedPajama-Data-1T:stackexchange",
+    "togethercomputer/RedPajama-Data-1T:arxiv"
+  ],
+  "pretrain_packed_shards": "data/tokenized/pretrain_mix_40b_balanced",
+  "pretrain_max_steps": 25,
+  "pretrain_lr": 2e-3,
+  "pretrain_batch_size": 32,
+  "pretrain_micro_batch_size": 5,
   "pretrain_warmup_steps": 5,
+  "pretrain_min_lr_ratio": 0.1,
+  "pretrain_eval_windows": 16,
 
-  "sft_max_steps": 4000,
+  "sft_max_steps": 0,
   "sft_lr": 5e-5,
   "sft_batch_size": 32,
   "sft_micro_batch_size": 4,
   "sft_dataset": "allenai/tulu-3-sft-mixture",
 
-  "dpo_max_steps": 1000,
+  "dpo_max_steps": 0,
   "dpo_lr": 3e-6,
   "dpo_batch_size": 16,
   "dpo_micro_batch_size": 2,
   "dpo_beta": 0.05,
   "dpo_dataset": "HuggingFaceH4/ultrafeedback_binarized",
 
-  "verifier_max_steps": 2000,
+  "verifier_max_steps": 0,
   "verifier_lr": 1e-4,
   "verifier_batch_size": 32,
   "verifier_micro_batch_size": 4,
 
   "seed": 42,
   "mixed_precision": "bf16",
-  "eval_every": 10000,
-  "save_every": 10000,
-  "log_every": 5
+  "eval_every": 5,
+  "save_every": 50,
+  "log_every": 1
 }

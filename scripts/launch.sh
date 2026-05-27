@@ -33,28 +33,16 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/data/raw/hf_cache}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-${REPO_ROOT}/data/raw/hf_home/hub}"
 mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HF_HUB_CACHE"
 
-# ---- NCCL defaults for PCIe consumer GPUs -----------------------------------
-# RTX 4090s do not support P2P over PCIe; leaving NCCL_P2P_DISABLE off causes
-# silent hangs. NCCL_IB_DISABLE skips InfiniBand probing on hosts without it.
-# NCCL_ASYNC_ERROR_HANDLING converts NCCL hangs into Python exceptions.
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
-export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
-
-# Slightly chattier NCCL logging on first run; comment out once stable.
-# export NCCL_DEBUG=INFO
-
-# ---- Tokenizer parallelism --------------------------------------------------
-# HF tokenizers spawns its own threads; under DataLoader workers this fights
-# the OS scheduler. Disable to keep wall-clock predictable.
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_DISTRIBUTED_TIMEOUT_MINUTES="${TORCH_DISTRIBUTED_TIMEOUT_MINUTES:-60}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-
-# ---- NUMA / CPU pinning -----------------------------------------------------
-# Match the user's known-good launcher template. Override NUMA_NODE if you
-# need a different socket. If `numactl` is missing we just skip pinning.
-
-# ---- Run --------------------------------------------------------------------
-# We always invoke `python3 scripts/run_pipeline.py ...` — run_pipeline.py
-# self-spawns under torchrun when --nproc-per-node > 1.
 cd "$REPO_ROOT"
-exec  numactl --cpunodebind=1  python3 scripts/run_pipeline.py "$@"
+
+
+numactl --cpunodebind=1 python3 scripts/run_pipeline.py "$@"
+numactl --cpunodebind=1 python3 scripts/evaluation/run_eval_sweep.py \
+    --runs-dir experiments/runs \
+    --output-root experiments/results/sweep \
+    --gpus 0 1 2 3

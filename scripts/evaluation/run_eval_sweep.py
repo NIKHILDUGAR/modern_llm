@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Sweep eval_all.py across every checkpoint in experiments/runs/ + HF baselines.
 
-Distributes jobs over a fixed GPU pool (default: 0,1,2) — one checkpoint per
-GPU at a time. Each job is a subprocess of `eval_all.py` with
-`CUDA_VISIBLE_DEVICES` pinned to a single physical GPU, so the three workers
-never fight for memory. Per-model per-task JSON lands under
+Distributes jobs over a fixed GPU pool (default: 0,1,2,3) with two eval jobs per
+GPU by default. Each job is a subprocess of `eval_all.py` with
+`CUDA_VISIBLE_DEVICES` pinned to a single physical GPU, so two workers may
+intentionally share each selected GPU. Per-model per-task JSON lands under
 `<output-root>/<model-slug>/`, and a single CSV rollup is written at
 `<output-root>/sweep_summary.csv`.
 
@@ -16,7 +16,8 @@ Usage:
     python scripts/evaluation/run_eval_sweep.py \\
         --runs-dir experiments/runs \\
         --output-root experiments/results/sweep \\
-        --gpus 0 1 2 \\
+        --gpus 0 1 2 3 \\
+        --jobs-per-gpu 2 \\
         --fast                        # small per-task sample caps
 """
 
@@ -34,7 +35,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 EVAL_DIR = Path(__file__).resolve().parent
 EVAL_ALL = EVAL_DIR / "eval_all.py"
@@ -48,22 +49,111 @@ from eval_all import TASKS as EVAL_TASKS  # noqa: E402
 EXPECTED_TASK_NAMES = [t.name for t in EVAL_TASKS]
 
 
-def is_already_evaluated(summary_path: Path) -> bool:
-    """Return True iff summary.json exists and every expected task ran ok with a metric."""
+def summary_is_complete(data: dict, expected_tasks: List[str]) -> bool:
+    """Return True iff every expected task ran successfully.
+
+    Some eval scripts complete but do not expose a headline metric under the
+    keys eval_all.py probes, yielding `"metric": null`. That should not force a
+    full rerun: the task output and raw summary are still present.
+    """
+    tasks = data.get("tasks") or []
+    by_name = {t.get("task"): t for t in tasks if isinstance(t, dict)}
+    for name in expected_tasks:
+        entry = by_name.get(name)
+        if not entry or entry.get("status") != "ok":
+            return False
+    return True
+
+
+def load_summary(summary_path: Path) -> Optional[dict]:
     if not summary_path.exists():
-        return False
+        return None
     try:
         data = json.loads(summary_path.read_text())
     except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def is_already_evaluated(summary_path: Path, expected_tasks: List[str]) -> bool:
+    """Return True iff summary.json exists and every expected task ran ok."""
+    data = load_summary(summary_path)
+    return bool(data is not None and summary_is_complete(data, expected_tasks))
+
+
+def spec_identity_keys(spec: Optional[str]) -> Set[str]:
+    """Build comparable ids for a checkpoint path or HF model id."""
+    if not spec:
+        return set()
+    keys = {spec}
+    path = Path(spec)
+    if path.suffix == ".pt":
+        abs_path = path if path.is_absolute() else PROJECT_ROOT / path
+        try:
+            abs_path = abs_path.resolve()
+        except Exception:
+            pass
+        keys.add(str(abs_path))
+        try:
+            keys.add(str(abs_path.relative_to(PROJECT_ROOT)))
+        except ValueError:
+            pass
+    return keys
+
+
+SummaryRecord = Tuple[Path, dict, Set[str]]
+
+
+def load_summary_records(output_root: Path) -> List[SummaryRecord]:
+    """Read existing eval_all summaries once for cache detection."""
+    if not output_root.exists():
+        return []
+    records: List[SummaryRecord] = []
+    for summary_path in output_root.rglob("eval_all_summary.json"):
+        data = load_summary(summary_path)
+        if data is None:
+            continue
+        records.append((summary_path, data, spec_identity_keys(data.get("checkpoint"))))
+    return records
+
+
+def summary_matches_job(data: dict, summary_keys: Set[str], job: Job,
+                        args: argparse.Namespace) -> bool:
+    if not (summary_keys & spec_identity_keys(job.spec)):
         return False
-    tasks = data.get("tasks") or []
-    by_name = {t.get("task"): t for t in tasks if isinstance(t, dict)}
-    expected = data.get("_expected_tasks") or EXPECTED_TASK_NAMES
-    for name in expected:
-        entry = by_name.get(name)
-        if not entry or entry.get("status") != "ok" or entry.get("metric") is None:
-            return False
+    if bool(data.get("fast", False)) != bool(args.fast):
+        return False
+    if data.get("tokenizer") != job.tokenizer:
+        return False
     return True
+
+
+def find_completed_summary(job: Job, output_root: Path, args: argparse.Namespace,
+                           expected_tasks: List[str],
+                           records: List[SummaryRecord]) -> Optional[Path]:
+    """Find a completed summary for this job, even if the slug changed."""
+    expected_path = output_root / job.slug / "eval_all_summary.json"
+
+    # Prefer the canonical path for this invocation.
+    for summary_path, data, summary_keys in records:
+        if summary_path == expected_path:
+            if (
+                summary_is_complete(data, expected_tasks)
+                and summary_matches_job(data, summary_keys, job, args)
+            ):
+                return summary_path
+            break
+
+    # Fall back to matching by checkpoint/HF id. This avoids reruns when the
+    # same output root was produced with a different --runs-dir, which changes
+    # the filesystem slug but not the evaluated model.
+    for summary_path, data, summary_keys in records:
+        if (
+            summary_is_complete(data, expected_tasks)
+            and summary_matches_job(data, summary_keys, job, args)
+        ):
+            return summary_path
+    return None
 
 
 HF_BASELINES = [
@@ -117,7 +207,11 @@ def build_jobs(args: argparse.Namespace) -> List[Job]:
     return jobs
 
 
-def run_job(job: Job, gpu_id: int, args: argparse.Namespace) -> dict:
+def worker_label(gpu_id: int, slot_id: int) -> str:
+    return f"GPU{gpu_id}.{slot_id}"
+
+
+def run_job(job: Job, gpu_id: int, slot_id: int, args: argparse.Namespace) -> dict:
     out_dir = Path(args.output_root) / job.slug
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "eval_all_summary.json"
@@ -142,13 +236,14 @@ def run_job(job: Job, gpu_id: int, args: argparse.Namespace) -> dict:
     # Avoid tokenizer thread storms when several workers run in parallel.
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    print(f"[sweep] GPU{gpu_id} start: {job.slug} ({job.kind})", flush=True)
+    label = worker_label(gpu_id, slot_id)
+    print(f"[sweep] {label} start: {job.slug} ({job.kind})", flush=True)
     t0 = time.time()
     with open(log_path, "wb") as log_fp:
         proc = subprocess.run(cmd, env=env, stdout=log_fp, stderr=subprocess.STDOUT)
     elapsed = time.time() - t0
     status = "ok" if proc.returncode == 0 else f"failed(rc={proc.returncode})"
-    print(f"[sweep] GPU{gpu_id} done : {job.slug} status={status} elapsed={elapsed:.1f}s", flush=True)
+    print(f"[sweep] {label} done : {job.slug} status={status} elapsed={elapsed:.1f}s", flush=True)
 
     summary: dict = {}
     if summary_path.exists():
@@ -160,6 +255,7 @@ def run_job(job: Job, gpu_id: int, args: argparse.Namespace) -> dict:
     return {
         "job": job.__dict__,
         "gpu": gpu_id,
+        "gpu_slot": slot_id,
         "returncode": proc.returncode,
         "status": status,
         "elapsed_s": elapsed,
@@ -169,7 +265,7 @@ def run_job(job: Job, gpu_id: int, args: argparse.Namespace) -> dict:
     }
 
 
-def worker_loop(gpu_id: int, job_q: "queue.Queue[Job]", results: list,
+def worker_loop(gpu_id: int, slot_id: int, job_q: "queue.Queue[Job]", results: list,
                 results_lock: threading.Lock, args: argparse.Namespace) -> None:
     while True:
         try:
@@ -177,10 +273,11 @@ def worker_loop(gpu_id: int, job_q: "queue.Queue[Job]", results: list,
         except queue.Empty:
             return
         try:
-            res = run_job(job, gpu_id, args)
+            res = run_job(job, gpu_id, slot_id, args)
         except Exception as exc:  # defensive — keep worker alive on unexpected errors
-            res = {"job": job.__dict__, "gpu": gpu_id, "status": f"exception:{exc}",
-                   "returncode": -1, "elapsed_s": 0, "summary": {}}
+            res = {"job": job.__dict__, "gpu": gpu_id, "gpu_slot": slot_id,
+                   "status": f"exception:{exc}", "returncode": -1,
+                   "elapsed_s": 0, "summary": {}}
         with results_lock:
             results.append(res)
         job_q.task_done()
@@ -243,10 +340,12 @@ def main() -> int:
                         help="Per-model results land under <output-root>/<model-slug>/.")
     parser.add_argument("--csv", default=None,
                         help="CSV path (default: <output-root>/sweep_summary.csv).")
-    parser.add_argument("--gpus", nargs="+", type=int, default=[0, 1, 2],
+    parser.add_argument("--gpus", nargs="+", type=int, default=[0, 1, 2, 3],
                         help="Physical GPU ids to use as the worker pool.")
+    parser.add_argument("--jobs-per-gpu", type=int, default=2,
+                        help="Concurrent eval_all.py jobs to run on each selected GPU.")
     parser.add_argument("--archived", choices=["skip", "only", "include"], default="include",
-                        help="How to treat experiments/runs/*archive_pre-4090* (default: skip).")
+                        help="How to treat experiments/runs/*archive_pre-4090* (default: include).")
     parser.add_argument("--no-baselines", action="store_true",
                         help="Skip gpt2 + SmolLM2-135M baselines.")
     parser.add_argument("--force", action="store_true",
@@ -258,32 +357,39 @@ def main() -> int:
     parser.add_argument("--skip", nargs="+", default=[],
                         help="Tasks to skip when calling eval_all.py.")
     args = parser.parse_args()
+    if args.jobs_per_gpu < 1:
+        parser.error("--jobs-per-gpu must be >= 1")
 
     jobs = build_jobs(args)
     if not jobs:
         print("[sweep] No jobs to run.", file=sys.stderr)
         return 1
+    expected_tasks = args.tasks if args.tasks else EXPECTED_TASK_NAMES
+    expected_tasks = [name for name in expected_tasks if name not in set(args.skip)]
 
     # Drop jobs whose summary.json already has every expected task completed.
     output_root = Path(args.output_root)
+    summary_records = load_summary_records(output_root)
     pending: List[Job] = []
-    skipped: List[Job] = []
-    cou=0
+    skipped: List[Tuple[Job, Path]] = []
     for j in jobs:
-        summary_path = output_root / j.slug / "eval_all_summary.json"
-        print(summary_path)
-        if not args.force and is_already_evaluated(summary_path):
-            cou+=1
-            print(f"skipping {summary_path} count ", cou )
-            skipped.append(j)
+        completed_summary = None if args.force else find_completed_summary(
+            j, output_root, args, expected_tasks, summary_records
+        )
+        if completed_summary is not None:
+            skipped.append((j, completed_summary))
         else:
             pending.append(j)
 
-    print(f"[sweep] {len(pending)} pending / {len(skipped)} already-done jobs across GPUs {args.gpus}:")
+    worker_count = len(args.gpus) * args.jobs_per_gpu
+    print(f"[sweep] {len(pending)} pending / {len(skipped)} already-done jobs "
+          f"across {worker_count} worker slots ({args.jobs_per_gpu}/GPU) on GPUs {args.gpus}:")
     for j in pending:
         print(f"  - [{j.kind}] {j.spec}  -> {j.slug}")
-    for j in skipped:
-        print(f"  - [skip-done] {j.spec}  -> {j.slug}")
+    for j, summary_path in skipped:
+        expected_path = output_root / j.slug / "eval_all_summary.json"
+        suffix = "" if summary_path == expected_path else f"  (cached at {summary_path})"
+        print(f"  - [skip-done] {j.spec}  -> {j.slug}{suffix}")
     jobs = pending
 
     job_q: "queue.Queue[Job]" = queue.Queue()
@@ -293,9 +399,10 @@ def main() -> int:
     results: List[dict] = []
     lock = threading.Lock()
     threads = [threading.Thread(target=worker_loop,
-                                args=(gpu, job_q, results, lock, args),
+                                args=(gpu, slot, job_q, results, lock, args),
                                 daemon=True)
-               for gpu in args.gpus]
+               for gpu in args.gpus
+               for slot in range(args.jobs_per_gpu)]
     t0 = time.time()
     for t in threads:
         t.start()
@@ -308,15 +415,15 @@ def main() -> int:
 
     # Fold previously-completed jobs back into the CSV so it covers every model
     # on disk, not just the ones we re-ran this session.
-    for j in skipped:
-        summary_path = output_root / j.slug / "eval_all_summary.json"
+    for j, summary_path in skipped:
         try:
             summary = json.loads(summary_path.read_text())
         except Exception:
             summary = {}
         results.append({
-            "job": j.__dict__, "gpu": -1, "returncode": 0, "status": "cached",
-            "elapsed_s": 0.0, "summary_path": str(summary_path), "summary": summary,
+            "job": j.__dict__, "gpu": -1, "gpu_slot": -1, "returncode": 0,
+            "status": "cached", "elapsed_s": 0.0,
+            "summary_path": str(summary_path), "summary": summary,
         })
     write_csv(results, csv_path)
 

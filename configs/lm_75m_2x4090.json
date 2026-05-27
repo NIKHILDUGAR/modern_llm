@@ -6,10 +6,11 @@
   "n_layers": 20,
   "n_heads": 8,
   "ffn_hidden_size": 1408,
-  "max_seq_len": 4096,
+  "max_seq_len": 2048,
   "dropout": 0.0,
 
   "use_rope": true,
+  "rope_pairing": "interleaved",
   "use_attention_sinks": false,
   "num_attention_sinks": 4,
   "use_swiglu": true,
@@ -33,18 +34,21 @@
     "togethercomputer/RedPajama-Data-1T:stackexchange",
     "togethercomputer/RedPajama-Data-1T:arxiv"
   ],
-  "pretrain_packed_shards": "data/tokenized/pretrain_mix_40b_balanced",
-  "pretrain_max_steps": 256000,
-  "pretrain_lr": 3e-3,
+  "pretrain_packed_shards": "data/tokenized/pretrain_mix_300b_balanced",
+  "pretrain_max_steps": 4577381,
+  "pretrain_lr": 9e-4,
   "pretrain_batch_size": 32,
-  "pretrain_micro_batch_size": 4,
-  "pretrain_warmup_steps": 4000,
-  "pretrain_min_lr_ratio": 0.1,
+
+  "pretrain_micro_batch_size": 8,
+  "pretrain_warmup_steps": 24000,
+  "pretrain_min_lr_ratio": 0.005,
   "pretrain_eval_windows": 4096,
-  "sft_max_steps": 20000,
-  "sft_lr": 5e-5,
+
+  "sft_lr": 3e-5,
+  "sft_max_steps": 140000,
+  "sft_num_examples_per_dataset": 280000,
   "sft_batch_size": 32,
-  "sft_micro_batch_size": 4,
+  "sft_micro_batch_size": 8,
   "sft_dataset": "allenai/tulu-3-sft-mixture",
   "sft_datasets": [
     "allenai/tulu-3-sft-mixture",
@@ -57,11 +61,12 @@
     "stanfordnlp/coqa"
   ],
 
-  "dpo_max_steps": 5000,
+  "dpo_max_steps": 15000,
   "dpo_lr": 3e-6,
   "dpo_batch_size": 16,
   "dpo_micro_batch_size": 4,
   "dpo_beta": 0.05,
+  "dpo_num_examples": 80000,
   "dpo_dataset": "HuggingFaceH4/ultrafeedback_binarized",
 
   "verifier_max_steps": 20,
@@ -73,5 +78,5 @@
   "mixed_precision": "bf16",
   "eval_every": 5000,
   "save_every": 10000,
-  "log_every": 100
+  "log_every": 1000
 }

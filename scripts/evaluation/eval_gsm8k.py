@@ -25,7 +25,7 @@ from tqdm import tqdm
 # Add local eval helpers and src to path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from _eval_common import DEFAULT_TOKENIZER, load_scratch_model
+from _eval_common import DEFAULT_TOKENIZER, greedy_generate, load_scratch_model
 
 
 def extract_answer(text: str) -> Optional[str]:
@@ -115,24 +115,19 @@ def generate_solutions(
 ) -> list[str]:
     """Generate solutions for a math question."""
     prompt = f"Question: {question}\n\nLet me solve this step by step:\n"
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
 
     solutions = []
     with torch.no_grad():
         for _ in range(n_samples):
-            # Simple greedy decode for scratch model
-            generated = inputs["input_ids"].clone()
-            for _ in range(max_length):
-                outputs = model(generated)
-                logits = outputs["logits"]
-                next_token = logits[0, -1, :].argmax()
-                generated = torch.cat([generated, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
-                if next_token == tokenizer.eos_token_id:
-                    break
-            
-            output = tokenizer.decode(generated[0], skip_special_tokens=True)
-            solutions.append(output[len(prompt):])
+            solutions.append(
+                greedy_generate(
+                    model,
+                    tokenizer,
+                    prompt,
+                    device,
+                    max_new_tokens=max_length,
+                )
+            )
 
     return solutions
 
@@ -176,7 +171,7 @@ def evaluate_gsm8k(
             error_counts[error_type] += 1
             if len(examples["errors"]) < 5:
                 examples["errors"].append({
-                    "question": question[:100],
+                    "question": question,
                     "gold": gold_answer,
                     "pred": pred_answer,
                     "error_type": error_type,
@@ -203,14 +198,14 @@ def evaluate_gsm8k(
             if is_correct_with_v and not is_correct_no_v:
                 if len(examples["false_negatives"]) < 3:
                     examples["false_negatives"].append({
-                        "question": question[:100],
+                        "question": question,
                         "gold": gold_answer,
                         "note": "Verifier correctly rescued this"
                     })
             elif not is_correct_with_v and is_correct_no_v:
                 if len(examples["false_positives"]) < 3:
                     examples["false_positives"].append({
-                        "question": question[:100],
+                        "question": question,
                         "gold": gold_answer,
                         "note": "Verifier wrongly rejected correct answer"
                     })

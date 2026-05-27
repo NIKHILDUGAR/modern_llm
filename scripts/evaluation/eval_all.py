@@ -161,6 +161,14 @@ def main() -> int:
                         help="Keep going after a task fails (default: on).")
     args = parser.parse_args()
 
+    if str(args.device).startswith("cuda") and not torch.cuda.is_available():
+        print(
+            "[eval_all] WARN: requested CUDA device, but torch.cuda.is_available() "
+            "is false in this process; falling back to CPU.",
+            flush=True,
+        )
+        args.device = "cpu"
+
     by_name = {t.name: t for t in TASKS}
     if args.tasks:
         unknown = [n for n in args.tasks if n not in by_name]
@@ -184,6 +192,7 @@ def main() -> int:
         summary_path.write_text(json.dumps({
             "checkpoint": args.checkpoint, "tokenizer": args.tokenizer,
             "device": args.device, "fast": args.fast,
+            "_expected_tasks": [t.name for t in selected],
             "tasks": results,
             "total_elapsed_s": time.time() - t_start,
         }, indent=2))

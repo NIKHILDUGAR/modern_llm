@@ -52,6 +52,9 @@ def prepare_model_for_quantization(model: nn.Module, config: QuantizationConfig 
         setattr(model, "_quantization_config", None)
         setattr(model, "_quantization_summary", summary.to_dict())
         return summary
+    model_config = getattr(model, "config", None)
+    if bool(getattr(model_config, "use_matformer", False)):
+        raise ValueError("MatFormer is not compatible with quantization in this patch")
 
     if not hasattr(model, "iter_quantizable_linear_layers"):
         raise TypeError("Model must define iter_quantizable_linear_layers() for quantization preparation.")

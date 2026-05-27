@@ -8,6 +8,7 @@
   "max_seq_len": 1024,
   "dropout": 0.1,
   "use_rope": true,
+  "rope_pairing": "interleaved",
   "use_attention_sinks": true,
   "num_attention_sinks": 4,
   "use_swiglu": true,
@@ -50,6 +51,5 @@
   "save_every": 2000,
   "log_every": 100
 }
-
 
 

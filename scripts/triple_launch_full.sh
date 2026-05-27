@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sequentially train regular, BitNet-quantized, and Gated DeltaNet variants,
-# then run one eval sweep across the resulting checkpoints.
+# Sequential full training run for general, LFM2, MatFormer, Gated
+# DeltaNet, and BitNet variants, then a full eval sweep including baselines.
 
 set -euo pipefail
 
@@ -23,16 +23,14 @@ cd "$REPO_ROOT"
 
 STAGE="${STAGE:-all}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-VARIANTS="${VARIANTS:-regular bitnet gated}"
+#VARIANTS="${VARIANTS:-regular lfm2 matformer gated bitnet}"
+VARIANTS="${VARIANTS:-lfm2 matformer gated bitnet}"
 
-# Default profile: a bounded multi-GPU reliability run. It uses the first
-# 10 completed 500M-token shards from the 40B mix and runs every training
-# stage for 1000 optimizer steps unless an env var below overrides it.
-RUN_ID="${RUN_ID:-triple_multigpu_1000step_$(date +%Y%m%d_%H%M%S)}"
-FULL_PACKED_SHARDS="${FULL_PACKED_SHARDS:-data/tokenized/pretrain_mix_40b_balanced}"
-TEST_PACKED_SHARDS="${TEST_PACKED_SHARDS:-data/tokenized/pretrain_mix_40b_balanced_10shard}"
-TEST_SHARD_COUNT="${TEST_SHARD_COUNT:-10}"
-TRAIN_STEPS="${TRAIN_STEPS:-1000}"
+# Full profile: use the complete packed shard directory and each config's
+# native step counts. Override these env vars only when intentionally resuming
+# or narrowing a run.
+RUN_ID="${RUN_ID:-triple_full_$(date +%Y%m%d_%H%M%S)}"
+FULL_PACKED_SHARDS="${FULL_PACKED_SHARDS:-data/tokenized/pretrain_multithread_300b_final}"
 
 EVAL_RUNS_DIR="${EVAL_RUNS_DIR:-experiments/runs/${RUN_ID}}"
 EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-experiments/results/${RUN_ID}_sweep}"
@@ -44,24 +42,28 @@ EVAL_SKIP="${EVAL_SKIP:-}"
 PIPELINE_FORCE="${PIPELINE_FORCE:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 
-PRETRAIN_PACKED_SHARDS="${PRETRAIN_PACKED_SHARDS:-$TEST_PACKED_SHARDS}"
+PRETRAIN_PACKED_SHARDS="${PRETRAIN_PACKED_SHARDS:-$FULL_PACKED_SHARDS}"
 MAX_STEPS="${MAX_STEPS:-}"
-PRETRAIN_STEPS="${PRETRAIN_STEPS:-$TRAIN_STEPS}"
-SFT_STEPS="${SFT_STEPS:-$TRAIN_STEPS}"
-DPO_STEPS="${DPO_STEPS:-$TRAIN_STEPS}"
-VERIFIER_STEPS="${VERIFIER_STEPS:-$TRAIN_STEPS}"
+PRETRAIN_STEPS="${PRETRAIN_STEPS:-}"
+SFT_STEPS="${SFT_STEPS:-}"
+DPO_STEPS="${DPO_STEPS:-}"
+VERIFIER_STEPS="${VERIFIER_STEPS:-}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-}"
-PRETRAIN_EVAL_WINDOWS="${PRETRAIN_EVAL_WINDOWS:-32}"
-SFT_NUM_EXAMPLES_PER_DATASET="${SFT_NUM_EXAMPLES_PER_DATASET:-8000}"
-DPO_NUM_EXAMPLES="${DPO_NUM_EXAMPLES:-20000}"
+PRETRAIN_EVAL_WINDOWS="${PRETRAIN_EVAL_WINDOWS:-}"
+SFT_NUM_EXAMPLES_PER_DATASET="${SFT_NUM_EXAMPLES_PER_DATASET:-}"
+DPO_NUM_EXAMPLES="${DPO_NUM_EXAMPLES:-}"
 
 REGULAR_OUTPUT_DIR="${REGULAR_OUTPUT_DIR:-experiments/runs/${RUN_ID}/lm-75m-2x4090_regular}"
-QUANT_OUTPUT_DIR="${QUANT_OUTPUT_DIR:-experiments/runs/${RUN_ID}/lm-75m-2x4090_quantized}"
+LFM2_OUTPUT_DIR="${LFM2_OUTPUT_DIR:-experiments/runs/${RUN_ID}/lm-75m-2x4090_lfm2}"
+MATFORMER_OUTPUT_DIR="${MATFORMER_OUTPUT_DIR:-experiments/runs/${RUN_ID}/lm-75m-2x4090_matformer}"
 GATED_OUTPUT_DIR="${GATED_OUTPUT_DIR:-experiments/runs/${RUN_ID}/lm-75m-2x4090_gated_deltanet}"
+BITNET_OUTPUT_DIR="${BITNET_OUTPUT_DIR:-experiments/runs/${RUN_ID}/lm-75m-2x4090_bitnet}"
 
 REGULAR_CHECKPOINT="${REGULAR_CHECKPOINT:-}"
-QUANT_CHECKPOINT="${QUANT_CHECKPOINT:-}"
+LFM2_CHECKPOINT="${LFM2_CHECKPOINT:-}"
+MATFORMER_CHECKPOINT="${MATFORMER_CHECKPOINT:-}"
 GATED_CHECKPOINT="${GATED_CHECKPOINT:-}"
+BITNET_CHECKPOINT="${BITNET_CHECKPOINT:-}"
 
 NUMACTL_PREFIX=()
 if command -v numactl >/dev/null 2>&1; then
@@ -77,29 +79,23 @@ maybe_run() {
     fi
 }
 
-if [[ "$PRETRAIN_PACKED_SHARDS" == "$TEST_PACKED_SHARDS" && ! -f "${PRETRAIN_PACKED_SHARDS}/index.json" ]]; then
-    echo "[setup] building ${TEST_SHARD_COUNT}-shard packed subset at ${PRETRAIN_PACKED_SHARDS}"
-    maybe_run python3 scripts/data/build_packed_subset.py \
-        --source-dir "$FULL_PACKED_SHARDS" \
-        --output-dir "$PRETRAIN_PACKED_SHARDS" \
-        --max-shards "$TEST_SHARD_COUNT"
-fi
-
 if [[ ! -f "${PRETRAIN_PACKED_SHARDS}/index.json" && "$DRY_RUN" == "true" ]]; then
     echo "[dry-run] packed pretrain index is not present yet: ${PRETRAIN_PACKED_SHARDS}/index.json"
 elif [[ ! -f "${PRETRAIN_PACKED_SHARDS}/index.json" ]]; then
     echo "ERROR: packed pretrain index not found: ${PRETRAIN_PACKED_SHARDS}/index.json" >&2
+    echo "Wait for tokenization to finish or set PRETRAIN_PACKED_SHARDS to a complete packed dataset." >&2
     exit 1
 fi
 
 echo
 echo "============================================================"
-echo "[triple] run_id=${RUN_ID}"
-echo "[triple] stage=${STAGE} nproc_per_node=${NPROC_PER_NODE} cuda=${CUDA_VISIBLE_DEVICES}"
-echo "[triple] variants=${VARIANTS}"
-echo "[triple] packed_shards=${PRETRAIN_PACKED_SHARDS}"
-echo "[triple] steps pretrain=${PRETRAIN_STEPS} sft=${SFT_STEPS} dpo=${DPO_STEPS} verifier=${VERIFIER_STEPS}"
-echo "[triple] dry_run=${DRY_RUN}"
+echo "[triple-full] run_id=${RUN_ID}"
+echo "[triple-full] stage=${STAGE} nproc_per_node=${NPROC_PER_NODE} cuda=${CUDA_VISIBLE_DEVICES}"
+echo "[triple-full] variants=${VARIANTS}"
+echo "[triple-full] packed_shards=${PRETRAIN_PACKED_SHARDS}"
+echo "[triple-full] steps=config defaults unless *_STEPS/MAX_STEPS env vars are set"
+echo "[triple-full] eval_fast=${EVAL_FAST} eval_no_baselines=${EVAL_NO_BASELINES}"
+echo "[triple-full] dry_run=${DRY_RUN}"
 echo "============================================================"
 
 variant_enabled() {
@@ -109,8 +105,10 @@ variant_enabled() {
         case "$item:$key" in
             all:*) return 0 ;;
             regular:regular|dense:regular) return 0 ;;
-            bitnet:bitnet|quant:bitnet|quantized:bitnet) return 0 ;;
+            lfm2:lfm2|hybrid-lfm2:lfm2|hybrid_lfm2:lfm2) return 0 ;;
+            matformer:matformer|mat-former:matformer) return 0 ;;
             gated:gated|deltanet:gated|gated-deltanet:gated) return 0 ;;
+            bitnet:bitnet|quant:bitnet|quantized:bitnet) return 0 ;;
         esac
     done
     return 1
@@ -171,21 +169,36 @@ else
     echo "[regular] skipped by VARIANTS=${VARIANTS}"
 fi
 
-if [[ "$STAGE" == "sft" && -z "$QUANT_CHECKPOINT" ]]; then
-    regular_pretrain="${REGULAR_OUTPUT_DIR}/lm-75m-2x4090-pretrain/lm-75m-2x4090-pretrain_final.pt"
-    if [[ -f "$regular_pretrain" ]]; then
-        QUANT_CHECKPOINT="$regular_pretrain"
-    fi
+if [[ "$STAGE" == "sft" && -z "$LFM2_CHECKPOINT" ]]; then
+    echo
+    echo "[lfm2] No LFM2_CHECKPOINT set. run_pipeline.py will look for a matching"
+    echo "[lfm2] pretrain checkpoint inside ${LFM2_OUTPUT_DIR}."
 fi
 
-if variant_enabled bitnet; then
-    run_variant "bitnet-quantized" \
-        "configs/lm_75m_2x4090_bitnet.json" \
-        "$QUANT_OUTPUT_DIR" \
-        "$QUANT_CHECKPOINT"
+if variant_enabled lfm2; then
+    run_variant "lfm2" \
+        "configs/lm_75m_2x4090_lfm2.json" \
+        "$LFM2_OUTPUT_DIR" \
+        "$LFM2_CHECKPOINT"
 else
     echo
-    echo "[bitnet-quantized] skipped by VARIANTS=${VARIANTS}"
+    echo "[lfm2] skipped by VARIANTS=${VARIANTS}"
+fi
+
+if [[ "$STAGE" == "sft" && -z "$MATFORMER_CHECKPOINT" ]]; then
+    echo
+    echo "[matformer] No MATFORMER_CHECKPOINT set. run_pipeline.py will look for a matching"
+    echo "[matformer] pretrain checkpoint inside ${MATFORMER_OUTPUT_DIR}."
+fi
+
+if variant_enabled matformer; then
+    run_variant "matformer" \
+        "configs/lm_75m_2x4090_matformer.json" \
+        "$MATFORMER_OUTPUT_DIR" \
+        "$MATFORMER_CHECKPOINT"
+else
+    echo
+    echo "[matformer] skipped by VARIANTS=${VARIANTS}"
 fi
 
 if [[ "$STAGE" == "sft" && -z "$GATED_CHECKPOINT" ]]; then
@@ -204,9 +217,30 @@ else
     echo "[gated-deltanet] skipped by VARIANTS=${VARIANTS}"
 fi
 
+if [[ "$STAGE" == "sft" && -z "$BITNET_CHECKPOINT" ]]; then
+    regular_pretrain="${REGULAR_OUTPUT_DIR}/lm-75m-2x4090-pretrain/lm-75m-2x4090-pretrain_final.pt"
+    if [[ -f "$regular_pretrain" ]]; then
+        BITNET_CHECKPOINT="$regular_pretrain"
+    else
+        echo
+        echo "[bitnet] No BITNET_CHECKPOINT set and regular pretrain checkpoint was not found."
+        echo "[bitnet] run_pipeline.py will look for a matching pretrain checkpoint inside ${BITNET_OUTPUT_DIR}."
+    fi
+fi
+
+if variant_enabled bitnet; then
+    run_variant "bitnet" \
+        "configs/lm_75m_2x4090_bitnet.json" \
+        "$BITNET_OUTPUT_DIR" \
+        "$BITNET_CHECKPOINT"
+else
+    echo
+    echo "[bitnet] skipped by VARIANTS=${VARIANTS}"
+fi
+
 echo
 echo "============================================================"
-echo "[eval] running checkpoint sweep"
+echo "[eval] running full checkpoint sweep with baselines"
 echo "============================================================"
 
 # shellcheck disable=SC2086 # EVAL_GPUS is intentionally split into argv items.

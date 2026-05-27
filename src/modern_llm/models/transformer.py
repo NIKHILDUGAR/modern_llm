@@ -12,6 +12,7 @@ This module documents the math/architecture before Phase 1 fleshes out the code.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Dict, Iterator, Optional
 
@@ -22,6 +23,7 @@ import torch.nn.functional as F
 from modern_llm.config.model_config import ModernLLMConfig
 from modern_llm.models.attention import AttentionConfig, MultiHeadAttention
 from modern_llm.models.gated_deltanet import GatedDeltaNet, GatedDeltaNetConfig
+from modern_llm.models.lfm2 import LFM2MLP, LFM2ShortConv
 from modern_llm.models.layers import RMSNorm, SwiGLU
 from modern_llm.models.moe import MixtureOfExperts
 
@@ -61,6 +63,9 @@ class DecoderBlock(nn.Module):
         super().__init__()
         self.layer_index = layer_index
         self.uses_gated_deltanet = config.uses_gated_deltanet_layer(layer_index)
+        self.uses_lfm2 = config.sequence_mixer == "hybrid_lfm2"
+        self.uses_lfm2_attention = config.uses_lfm2_attention_layer(layer_index)
+        self.uses_lfm2_short_conv = self.uses_lfm2 and not self.uses_lfm2_attention
         if self.uses_gated_deltanet:
             self.gated_deltanet = GatedDeltaNet(
                 GatedDeltaNetConfig(
@@ -71,6 +76,12 @@ class DecoderBlock(nn.Module):
                     rmsnorm_eps=config.rmsnorm_eps,
                 )
             )
+        elif self.uses_lfm2_short_conv:
+            self.conv = LFM2ShortConv(
+                d_model=config.d_model,
+                kernel_size=config.lfm2_conv_kernel,
+                bias=config.lfm2_conv_bias,
+            )
         else:
             attn_config = AttentionConfig(
                 d_model=config.d_model,
@@ -78,6 +89,7 @@ class DecoderBlock(nn.Module):
                 use_rope=config.use_rope,
                 rope_theta=config.rope_theta,
                 rope_scaling=config.rope_scaling,
+                rope_pairing=config.rope_pairing,
                 use_attention_sinks=config.use_attention_sinks,
                 num_attention_sinks=config.num_attention_sinks,
                 use_gqa=config.use_gqa,
@@ -90,7 +102,9 @@ class DecoderBlock(nn.Module):
         self.attn_norm = RMSNorm(config.d_model, config.rmsnorm_eps)
         self.ffn_norm = RMSNorm(config.d_model, config.rmsnorm_eps)
         hidden = config.ffn_hidden_size
-        if config.use_moe and config.moe_config is not None:
+        if self.uses_lfm2:
+            self.ffn = LFM2MLP(config.d_model, hidden)
+        elif config.use_moe and config.moe_config is not None:
             self.ffn = MixtureOfExperts(config.d_model, config.moe_config)
         else:
             self.ffn = SwiGLU(config.d_model, hidden, out_features=config.d_model)
@@ -101,16 +115,24 @@ class DecoderBlock(nn.Module):
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        matformer_hidden_size: Optional[int] = None,
     ) -> Tensor:
         attn_input = self.attn_norm(hidden_states)
         if self.uses_gated_deltanet:
             attn_output = self.gated_deltanet(attn_input, padding_mask=padding_mask)
+        elif self.uses_lfm2_short_conv:
+            attn_output = self.conv(attn_input, padding_mask=padding_mask)
         else:
             attn_output = self.attn(attn_input, attention_mask=attention_mask)
         hidden_states = hidden_states + self.dropout(attn_output)
 
         ffn_input = self.ffn_norm(hidden_states)
-        ffn_output = self.ffn(ffn_input)
+        if isinstance(self.ffn, SwiGLU):
+            ffn_output = self.ffn(ffn_input, active_hidden_size=matformer_hidden_size)
+        else:
+            if matformer_hidden_size is not None:
+                raise ValueError("MatFormer FFN slicing requires a SwiGLU feedforward block")
+            ffn_output = self.ffn(ffn_input)
         hidden_states = hidden_states + self.dropout(ffn_output)
         return hidden_states
 
@@ -155,8 +177,13 @@ class ModernDecoderLM(nn.Module):
             gated_out = getattr(getattr(block, "gated_deltanet", None), "out_proj", None)
             if isinstance(gated_out, nn.Linear):
                 gated_out.weight.data.mul_(scale)
+            lfm2_conv_out = getattr(getattr(block, "conv", None), "out_proj", None)
+            if isinstance(lfm2_conv_out, nn.Linear):
+                lfm2_conv_out.weight.data.mul_(scale)
             ffn = block.ffn
             ffn_out = getattr(ffn, "proj", None)
+            if ffn_out is None:
+                ffn_out = getattr(ffn, "w2", None)
             if isinstance(ffn_out, nn.Linear):
                 ffn_out.weight.data.mul_(scale)
 
@@ -165,6 +192,7 @@ class ModernDecoderLM(nn.Module):
         input_ids: Tensor,
         attention_mask: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
+        matformer_granularity: int | Sequence[int] | None = None,
     ) -> Dict[str, Optional[Tensor]]:
         """Causal LM forward pass (to be implemented in Phase 1).
 
@@ -184,6 +212,7 @@ class ModernDecoderLM(nn.Module):
             )
 
         device = input_ids.device
+        matformer_plan = self._resolve_matformer_plan(matformer_granularity, device)
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_len), device=device, dtype=torch.long)
         if attention_mask.shape != input_ids.shape:
@@ -197,8 +226,17 @@ class ModernDecoderLM(nn.Module):
 
         padding_mask = attention_mask.to(dtype=hidden_states.dtype)
         attention_bias = self._build_attention_bias(attention_mask, hidden_states.dtype)
-        for block in self.blocks:
-            hidden_states = block(hidden_states, attention_bias, padding_mask=padding_mask)
+        if matformer_plan is None:
+            for block in self.blocks:
+                hidden_states = block(hidden_states, attention_bias, padding_mask=padding_mask)
+        else:
+            for block, active_hidden_size in zip(self.blocks, matformer_plan):
+                hidden_states = block(
+                    hidden_states,
+                    attention_bias,
+                    padding_mask=padding_mask,
+                    matformer_hidden_size=active_hidden_size,
+                )
 
         hidden_states = self.final_norm(hidden_states)
         logits = self.lm_head(hidden_states)
@@ -222,6 +260,58 @@ class ModernDecoderLM(nn.Module):
 
         return {"logits": logits, "loss": loss}
 
+    def _resolve_matformer_plan(
+        self,
+        requested: int | Sequence[int] | None,
+        device: torch.device,
+    ) -> Optional[list[int]]:
+        if requested is not None and not self.config.use_matformer:
+            raise ValueError("matformer_granularity requires use_matformer=True")
+        if not self.config.use_matformer:
+            return None
+
+        if requested is None:
+            if self.training and self.config.matformer_train_sample:
+                sampled = self._sample_matformer_granularity(device)
+                return [sampled] * self.config.n_layers
+            requested = self.config.matformer_active_granularity
+            if requested is None:
+                return None
+
+        allowed = set(self.config.matformer_granularities or [])
+        if isinstance(requested, int) and not isinstance(requested, bool):
+            return [self._validate_matformer_granularity(requested, allowed)] * self.config.n_layers
+
+        if isinstance(requested, Sequence) and not isinstance(requested, (str, bytes)):
+            if len(requested) != self.config.n_layers:
+                raise ValueError(
+                    f"per-layer matformer_granularity must have length {self.config.n_layers}"
+                )
+            return [self._validate_matformer_granularity(value, allowed) for value in requested]
+
+        raise ValueError("matformer_granularity must be an int or per-layer sequence of ints")
+
+    def _sample_matformer_granularity(self, device: torch.device) -> int:
+        granularities = self.config.matformer_granularities or [self.config.ffn_hidden_size]
+        if self.config.matformer_sampling_probs is None:
+            index = torch.randint(len(granularities), (), device=device).item()
+        else:
+            weights = torch.tensor(
+                self.config.matformer_sampling_probs,
+                device=device,
+                dtype=torch.float32,
+            )
+            index = torch.multinomial(weights, 1).item()
+        return granularities[int(index)]
+
+    @staticmethod
+    def _validate_matformer_granularity(value: object, allowed: set[int]) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("matformer_granularity values must be integers")
+        if value not in allowed:
+            raise ValueError("matformer_granularity must be one of matformer_granularities")
+        return value
+
     def _build_attention_bias(self, attention_mask: Tensor, dtype: torch.dtype) -> Tensor:
         batch_size, seq_len = attention_mask.shape
         device = attention_mask.device
@@ -237,6 +327,10 @@ class ModernDecoderLM(nn.Module):
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv1d):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -271,7 +365,19 @@ class ModernDecoderLM(nn.Module):
                         block_index=block_idx,
                         group="gated_deltanet",
                     )
-            for attr_name in ("gate", "proj"):
+            lfm2_conv = getattr(block, "conv", None)
+            for attr_name in ("in_proj", "out_proj"):
+                module = getattr(lfm2_conv, attr_name, None)
+                if isinstance(module, nn.Linear):
+                    yield QuantizableLinearRef(
+                        module_path=f"blocks.{block_idx}.conv.{attr_name}",
+                        parent=lfm2_conv,
+                        attr_name=attr_name,
+                        module=module,
+                        block_index=block_idx,
+                        group="lfm2_conv",
+                    )
+            for attr_name in ("gate", "proj", "w1", "w2", "w3"):
                 module = getattr(block.ffn, attr_name, None)
                 if isinstance(module, nn.Linear):
                     yield QuantizableLinearRef(

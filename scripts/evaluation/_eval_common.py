@@ -47,9 +47,11 @@ _VALID_CONFIG_KEYS = {
     "rope_theta", "rope_scaling", "use_rope", "use_attention_sinks",
     "num_attention_sinks", "use_swiglu", "swiglu_multiplier", "use_gqa",
     "gqa_groups", "use_qk_norm", "use_moe", "moe_config", "tie_embeddings",
-    "scale_embeddings", "residual_init_scale", "z_loss_coef",
+    "scale_embeddings", "residual_init_scale", "z_loss_coef", "rope_pairing",
     "sequence_mixer", "gated_deltanet_layers", "gated_deltanet_num_heads",
-    "gated_deltanet_conv_kernel",
+    "gated_deltanet_conv_kernel", "use_matformer", "matformer_granularities",
+    "matformer_train_sample", "matformer_sampling_probs",
+    "matformer_active_granularity",
 }
 
 
@@ -91,6 +93,25 @@ def _looks_like_hf_id(spec: str) -> bool:
     return True
 
 
+def resolve_torch_device(device: str | torch.device) -> str:
+    """Return a usable torch device string, falling back from CUDA to CPU.
+
+    Sweep workers pin CUDA with CUDA_VISIBLE_DEVICES, but stale shells,
+    containers without GPU access, or scheduler wrappers can still make
+    torch.cuda.is_available() false inside child eval processes. Loading on CPU
+    is slow but much better than failing every benchmark before it starts.
+    """
+    device_str = str(device)
+    if device_str.startswith("cuda") and not torch.cuda.is_available():
+        print(
+            "[eval] WARN: requested CUDA device, but CUDA is unavailable in "
+            "this process; using CPU.",
+            flush=True,
+        )
+        return "cpu"
+    return device_str
+
+
 def load_scratch_model(checkpoint_path: str, device: str, tokenizer_name: str = DEFAULT_TOKENIZER):
     """Load a ModernDecoderLM checkpoint + matching tokenizer.
 
@@ -108,6 +129,8 @@ def load_scratch_model(checkpoint_path: str, device: str, tokenizer_name: str = 
     from modern_llm.config.model_config import ModernLLMConfig
     from modern_llm.models.transformer import ModernDecoderLM
 
+    device = resolve_torch_device(device)
+
     if _looks_like_hf_id(checkpoint_path):
         from transformers import AutoModelForCausalLM
         hf_model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
@@ -121,7 +144,7 @@ def load_scratch_model(checkpoint_path: str, device: str, tokenizer_name: str = 
             tokenizer.pad_token = tokenizer.eos_token
         return model, tokenizer
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     if "config" in checkpoint:
         cfg = dict(checkpoint["config"])
@@ -157,6 +180,7 @@ def score_completion(model, tokenizer, prompt: str, completion: str, device: str
     prompt+completion sequence. Longer completions get more-negative scores, so
     callers that compare completions of different lengths should length-normalize.
     """
+    device = resolve_torch_device(device)
     max_len = getattr(model.config, "max_seq_len", 1024)
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     completion_ids = tokenizer.encode(completion, add_special_tokens=False)
@@ -194,6 +218,7 @@ def mc_argmax(
     length_normalize=True divides by completion token count (useful when
     choices differ greatly in length, e.g. HellaSwag endings).
     """
+    device = resolve_torch_device(device)
     scores = []
     for c in choices:
         s = score_completion(model, tokenizer, prompt, c, device)
@@ -218,6 +243,7 @@ def greedy_generate(
     The scratch model has no KV cache, so this is O(max_new_tokens * seq)
     per call. Kept simple on purpose.
     """
+    device = resolve_torch_device(device)
     max_len = getattr(model.config, "max_seq_len", 1024)
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if len(prompt_ids) >= max_len:

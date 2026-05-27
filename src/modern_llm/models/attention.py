@@ -35,6 +35,7 @@ class AttentionConfig:
     use_rope: bool = True
     rope_theta: float = 10000.0
     rope_scaling: Optional[float] = None
+    rope_pairing: str = "half_split"
     use_attention_sinks: bool = False
     num_attention_sinks: int = 2
     use_gqa: bool = False
@@ -217,8 +218,9 @@ class MultiHeadAttention(nn.Module):
         return (tensor * cos) + (self._rotate_half(tensor) * sin)
 
     def _get_rope_factors(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[Tensor, Tensor]:
+        inv_freq = self._get_inv_freq(device)
         freqs = torch.outer(
-            torch.arange(seq_len, device=device), self.inv_freq.to(device=device)
+            torch.arange(seq_len, device=device), inv_freq
         )
         if self.config.rope_scaling:
             freqs = freqs * self.config.rope_scaling
@@ -226,8 +228,35 @@ class MultiHeadAttention(nn.Module):
         sin = torch.sin(freqs).repeat_interleave(2, dim=-1).to(dtype=dtype)
         return cos, sin
 
-    @staticmethod
-    def _rotate_half(x: Tensor) -> Tensor:
+    def _get_inv_freq(self, device: torch.device) -> Tensor:
+        """Return a valid RoPE frequency buffer, repairing HF meta-load damage."""
+
+        inv_freq = getattr(self, "inv_freq", None)
+        expected = self.head_dim // 2
+        expected_inv_freq = 1.0 / (
+            self.config.rope_theta
+            ** (torch.arange(0, self.head_dim, 2, device=device).float() / self.head_dim)
+        )
+        if (
+            not isinstance(inv_freq, Tensor)
+            or inv_freq.numel() != expected
+            or inv_freq.device.type == "meta"
+            or not torch.isfinite(inv_freq.detach().float()).all()
+            or not torch.allclose(
+                inv_freq.to(device=device).detach().float(),
+                expected_inv_freq,
+                rtol=1e-5,
+                atol=1e-7,
+            )
+        ):
+            self.register_buffer("inv_freq", expected_inv_freq, persistent=False)
+            return expected_inv_freq
+        return inv_freq.to(device=device)
+
+    def _rotate_half(self, x: Tensor) -> Tensor:
+        if self.config.rope_pairing == "interleaved":
+            x_even = x[..., ::2]
+            x_odd = x[..., 1::2]
+            return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
         x1, x2 = x[..., : x.size(-1) // 2], x[..., x.size(-1) // 2 :]
         return torch.cat([-x2, x1], dim=-1)
-

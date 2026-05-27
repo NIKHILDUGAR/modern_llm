@@ -13,6 +13,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -103,13 +104,36 @@ class SwiGLU(nn.Module):
         self.gate = nn.Linear(in_features, hidden_features * 2, bias=bias)
         self.proj = nn.Linear(hidden_features, self.out_features, bias=bias)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, active_hidden_size: int | None = None) -> Tensor:
         if x.shape[-1] != self.in_features:
             raise ValueError(
                 f"Input last dimension mismatch: expected {self.in_features}, got {x.shape[-1]}"
             )
-        gate_out, value = self.gate(x).chunk(2, dim=-1)  # gate/value split per GLU family.
+        if active_hidden_size is None or active_hidden_size == self.hidden_features:
+            gate_out, value = self.gate(x).chunk(2, dim=-1)  # gate/value split per GLU family.
+            activated = _swish(gate_out)
+            gated = activated * value
+            return self.proj(gated)
+
+        if (
+            isinstance(active_hidden_size, bool)
+            or not isinstance(active_hidden_size, int)
+            or active_hidden_size <= 0
+        ):
+            raise ValueError("active_hidden_size must be a positive integer")
+        if active_hidden_size > self.hidden_features:
+            raise ValueError(
+                f"active_hidden_size must be <= hidden_features "
+                f"({active_hidden_size} > {self.hidden_features})"
+            )
+
+        gate_bias = self.gate.bias[:active_hidden_size] if self.gate.bias is not None else None
+        value_start = self.hidden_features
+        value_end = value_start + active_hidden_size
+        value_bias = self.gate.bias[value_start:value_end] if self.gate.bias is not None else None
+
+        gate_out = F.linear(x, self.gate.weight[:active_hidden_size], gate_bias)
+        value = F.linear(x, self.gate.weight[value_start:value_end], value_bias)
         activated = _swish(gate_out)
         gated = activated * value
-        return self.proj(gated)
-
+        return F.linear(gated, self.proj.weight[:, :active_hidden_size], self.proj.bias)

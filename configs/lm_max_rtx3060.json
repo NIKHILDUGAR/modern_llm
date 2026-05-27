@@ -11,6 +11,7 @@
   "rope_theta": 10000.0,
   "dropout": 0.1,
   "use_rope": true,
+  "rope_pairing": "interleaved",
   "use_attention_sinks": true,
   "num_attention_sinks": 4,
   "use_swiglu": true,
@@ -28,6 +29,5 @@
   "max_grad_norm": 1.0,
   "compile_model": false
 }
-
 
 
